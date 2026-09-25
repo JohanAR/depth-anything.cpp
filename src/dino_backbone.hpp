@@ -26,15 +26,16 @@ public:
                     std::vector<std::vector<std::vector<float>>>& feats,
                     std::vector<std::vector<std::vector<float>>>& cam_tokens,
                     int* out_b_idx = nullptr);
-    // Fused single-image path: build the SAME block loop as forward() but, at each
-    // out-layer, produce the feat tensor IN-GRAPH instead of capturing to host:
-    //   feat = ggml_concat([ local_x, layernorm(x, vit.norm.{w,b}, ln_eps) ], dim0)
-    //          with token-0 stripped -> [2*embed, Npatch] (ne0=channel, ne1=token).
-    // This matches forward()'s host post-process (cat[local_x_raw, norm(x)]) so the
-    // features never leave the device. out_feat[o] for o in [0, out_layers.size()).
-    // Restricted to cat_token=true (BASE/giant); returns false otherwise. Built into
-    // the caller's compute() ctx/pool (engine fuses this with the DPT head graph).
+    // Fused single-image path: produce all four intermediate feature tensors in
+    // the caller's graph instead of capturing them to host. Supports both DA3's
+    // cat([local_x,norm(x)]) features and DA2/mono/metric norm(x)-only features.
     bool build_feats_graph(ggml_context* ctx, const std::vector<float>& input_chw,
+                           int H, int W, GraphInputPool& pool, ggml_tensor* out_feat[4]);
+    // Same graph, but consume an already backend-resident normalized CHW tensor
+    // [W,H,3,1]. This is the zero-host-copy hook used by Vulkan/media integrations.
+    // The tensor may come from a different ggml_context as long as its metadata and
+    // backend buffer stay alive through graph execution (weights work the same way).
+    bool build_feats_graph(ggml_context* ctx, ggml_tensor* input_chw,
                            int H, int W, GraphInputPool& pool, ggml_tensor* out_feat[4]);
 private:
     std::vector<float> interp_pos_embed(int gh, int gw) const;  // host bicubic -> [(1+gh*gw)*embed], token-major embed-minor

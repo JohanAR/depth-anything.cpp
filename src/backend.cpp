@@ -1,5 +1,6 @@
 #include "backend.hpp"
 #include "common.hpp"
+#include "compute_mode.hpp"
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -52,12 +53,28 @@ struct Backend::Impl {
     std::vector<ggml_tensor*>   roots;
 };
 
-Backend::Backend() : impl_(new Impl()) {
-    // Optional override via DA_DEVICE: "cpu" forces CPU; a device name selects
-    // that registry device (case-insensitive); unset auto-picks a GPU/IGPU.
-    const char* force = std::getenv("DA_DEVICE");
-    const std::string want = force ? force : "";
-    const bool force_cpu = want == "cpu" || want == "CPU";
+Backend::Backend(const BackendOptions& options) : impl_(new Impl()) {
+    // Preserve the existing environment-driven behaviour by default, but allow
+    // embedders (notably media players) to make device choice per-context.
+    std::string want;
+    bool force_cpu = false;
+    switch (options.device_policy) {
+        case DevicePolicy::Environment: {
+            const char* force = std::getenv("DA_DEVICE");
+            want = force ? force : "";
+            force_cpu = want == "cpu" || want == "CPU";
+            break;
+        }
+        case DevicePolicy::Auto:
+            break;
+        case DevicePolicy::Cpu:
+            want = "cpu";
+            force_cpu = true;
+            break;
+        case DevicePolicy::Named:
+            want = options.device_name;
+            break;
+    }
 
     // Case-insensitive equality, used to match DA_DEVICE against the registry's
     // device names (upper-case like "CUDA0"/"Vulkan0").
@@ -94,9 +111,9 @@ Backend::Backend() : impl_(new Impl()) {
         };
 
         if (!want.empty()) {
-            // Explicit DA_DEVICE: match by name (e.g. "Vulkan1", "CUDA0").
+            // Explicit device request: match by name (e.g. "Vulkan1", "CUDA0").
             if (!try_pick([&](auto, const char* name) { return name && iequals(want, name); }))
-                DA_LOG("da::Backend: DA_DEVICE=%s not found; falling back to CPU",
+                DA_LOG("da::Backend: device %s not found; falling back to CPU",
                        want.c_str());
         } else {
             // Auto-pick: prefer a DISCRETE GPU over an integrated one. On multi-GPU
@@ -210,8 +227,10 @@ void Backend::add_graph_root(ggml_tensor* t) {
     impl_->roots.push_back(t);
 }
 
-bool Backend::compute(const std::function<ggml_tensor*(ggml_context*)>& build,
-                      std::vector<float>& out, size_t graph_nodes) {
+bool Backend::compute_impl(const std::function<ggml_tensor*(ggml_context*)>& build,
+                           std::vector<float>* out,
+                           const std::function<bool(ggml_backend_t, const ggml_tensor*)>* consume,
+                           size_t graph_nodes) {
     if (!impl_ || !impl_->backend) {
         DA_LOG("Backend::compute called on an uninitialised backend");
         return false;
@@ -237,6 +256,10 @@ bool Backend::compute(const std::function<ggml_tensor*(ggml_context*)>& build,
     impl_->pending.clear();
     impl_->captures.clear();
     impl_->roots.clear();
+    // Upstream graph builders choose a few CPU/GPU-specific ops through gpu_mode().
+    // Scope that decision to THIS backend invocation rather than model load, so a
+    // CPU context and a Vulkan/CUDA/Metal context can execute concurrently.
+    ScopedComputeMode compute_mode(offloading_);
     struct ggml_tensor* output = build(ctx);
     if (!output) {
         DA_LOG("Backend::compute: build() returned null output tensor");
@@ -397,12 +420,37 @@ bool Backend::compute(const std::function<ggml_tensor*(ggml_context*)>& build,
     impl_->captures.clear();
     impl_->roots.clear();
 
-    size_t n = (size_t)ggml_nelements(output);
-    out.resize(n);
-    ggml_backend_tensor_get(output, out.data(), 0, n * sizeof(float));
+    bool consume_ok = true;
+    if (consume) {
+        ggml_backend_t output_backend = impl_->backend;
+        if (need_sched && impl_->sched) {
+            ggml_backend_t placed = ggml_backend_sched_get_tensor_backend(impl_->sched, output);
+            if (placed) output_backend = placed;
+        }
+        consume_ok = (*consume)(output_backend, output);
+    }
+
+    if (out) {
+        size_t n = (size_t)ggml_nelements(output);
+        out->resize(n);
+        ggml_backend_tensor_get(output, out->data(), 0, n * sizeof(float));
+    }
 
     ggml_free(ctx);
-    return true;
+    return consume_ok;
+}
+
+bool Backend::compute(const std::function<ggml_tensor*(ggml_context*)>& build,
+                      std::vector<float>& out, size_t graph_nodes) {
+    return compute_impl(build, &out, nullptr, graph_nodes);
+}
+
+bool Backend::compute_device(
+        const std::function<ggml_tensor*(ggml_context*)>& build,
+        const std::function<bool(ggml_backend_t, const ggml_tensor*)>& consume,
+        size_t graph_nodes) {
+    if (!consume) return false;
+    return compute_impl(build, nullptr, &consume, graph_nodes);
 }
 
 bool Backend::forward_capture(const std::function<ggml_tensor*(ggml_context*)>& build,

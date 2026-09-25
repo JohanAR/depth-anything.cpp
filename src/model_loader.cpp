@@ -10,8 +10,8 @@
 
 namespace da {
 
-// --- Global GPU compute-mode flag (see compute_mode.hpp) -------------------
-static bool g_gpu_mode = false;
+// --- Thread-local graph-build compute mode (see compute_mode.hpp) -----------
+static thread_local bool g_gpu_mode = false;
 void set_gpu_mode(bool on){ g_gpu_mode = on; }
 bool gpu_mode(){ return g_gpu_mode; }
 

@@ -1,0 +1,36 @@
+diff --git a/src/ggml-vulkan/ggml-vulkan.cpp b/src/ggml-vulkan/ggml-vulkan.cpp
+--- a/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -6009,5 +6009,9 @@ static vk_device ggml_vk_get_device(size_t idx) {
+         bool bfloat16_support = false;
+         bool dot2_f16_support = false;
+         bool ocp_microscaling_extension = false;
+         bool shader_float8_extension = false;
++#if defined(VK_KHR_external_memory_fd) && defined(VK_KHR_external_semaphore_fd)
++        bool external_memory_fd_support = false;
++        bool external_semaphore_fd_support = false;
++#endif
+         for (const auto& properties : ext_props) {
+@@ -6073,6 +6077,12 @@ static vk_device ggml_vk_get_device(size_t idx) {
+             } else if (strcmp("VK_EXT_shader_64bit_indexing", properties.extensionName) == 0) {
+                 device->shader_64b_indexing = true;
+ #endif
+             } else if (strcmp(VK_KHR_INTERNALLY_SYNCHRONIZED_QUEUES_EXTENSION_NAME, properties.extensionName) == 0) {
+                 internally_sync_support = true;
++#if defined(VK_KHR_external_memory_fd) && defined(VK_KHR_external_semaphore_fd)
++            } else if (strcmp(VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME, properties.extensionName) == 0) {
++                external_memory_fd_support = true;
++            } else if (strcmp(VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME, properties.extensionName) == 0) {
++                external_semaphore_fd_support = true;
++#endif
+             } else if (strcmp("VK_EXT_device_fault", properties.extensionName) == 0) {
+@@ -6245,4 +6255,9 @@ static vk_device ggml_vk_get_device(size_t idx) {
+         std::vector<vk::DeviceQueueCreateInfo> device_queue_create_infos;
+         vk::DeviceCreateInfo device_create_info{};
+         std::vector<const char *> device_extensions;
++#if defined(VK_KHR_external_memory_fd) && defined(VK_KHR_external_semaphore_fd)
++        // Optional Linux cross-device embedding interop.
++        if (external_memory_fd_support) device_extensions.push_back(VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME);
++        if (external_semaphore_fd_support) device_extensions.push_back(VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME);
++#endif
+         vk::PhysicalDeviceFeatures device_features = device->physical_device.getFeatures();

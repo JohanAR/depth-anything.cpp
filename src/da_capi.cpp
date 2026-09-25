@@ -24,6 +24,8 @@
 struct da_ctx {
     std::unique_ptr<da::Engine> engine;
     std::string last_error;
+    std::string device_name;
+    bool is_offloading = false;
     // Per-frame capture poses from the most recent da_capi_points_stream call (OpenCV
     // axes, 3F each). da_capi_points_stream is at the purego arg-count ceiling, so these
     // are retrieved via da_capi_stream_last_poses instead of as out-params.
@@ -73,6 +75,39 @@ static bool capi_is_metric(const da::Config& cfg){
            n.find("mono")   != std::string::npos;
 }
 
+static void capi_identity3(float m[9]){
+    if (!m) return;
+    const float ident[9] = {
+        1.f, 0.f, 0.f,
+        0.f, 1.f, 0.f,
+        0.f, 0.f, 1.f,
+    };
+    std::memcpy(m, ident, sizeof(ident));
+}
+
+static void capi_full_uv_rect(float r[4]){
+    if (!r) return;
+    r[0] = 0.f; r[1] = 0.f; r[2] = 1.f; r[3] = 1.f;
+}
+
+static bool capi_matrix_all_zero(const float m[9]){
+    if (!m) return true;
+    for (int i = 0; i < 9; ++i) if (m[i] != 0.f) return false;
+    return true;
+}
+
+static int capi_depth_semantics(const da::Engine& e){
+    if (e.is_nested() || capi_is_metric(e.config()))
+        return DA_CAPI_DEPTH_SEMANTICS_METRIC_METERS;
+    return DA_CAPI_DEPTH_SEMANTICS_RELATIVE;
+}
+
+static bool capi_camera_intrinsics_capable(const da::Engine& e){
+    // DA2 and standalone mono checkpoints expose depth only. DualDPT/nested
+    // variants have a camera path in the full image pipeline.
+    return e.is_nested() || (!e.is_da2() && !e.is_mono());
+}
+
 // Run the nested metric pipeline (anyview GIANT + metric ViT-L branches ->
 // alignment) for a single image. Fills depth + scaled ext/intr + processed dims.
 // Returns false with c->last_error set on failure.
@@ -89,8 +124,92 @@ static bool capi_run_nested(da_ctx* c, const char* image_path,
     return true;
 }
 
+static da_capi_load_options capi_default_load_options(int n_threads){
+    da_capi_load_options o{};
+    o.struct_size = sizeof(o);
+    o.n_threads = n_threads;
+    o.device_policy = DA_CAPI_DEVICE_DEFAULT;
+    o.device_name = nullptr;
+    return o;
+}
+
+static bool capi_engine_load_options(const da_capi_load_options* in, da::EngineLoadOptions& out){
+    const da_capi_load_options def = capi_default_load_options(1);
+    const da_capi_load_options* o = in ? in : &def;
+    if (o->struct_size < sizeof(da_capi_load_options)) return false;
+    out.n_threads = o->n_threads;
+    switch (o->device_policy) {
+        case DA_CAPI_DEVICE_DEFAULT:
+            out.backend.device_policy = da::DevicePolicy::Environment;
+            break;
+        case DA_CAPI_DEVICE_AUTO:
+            out.backend.device_policy = da::DevicePolicy::Auto;
+            break;
+        case DA_CAPI_DEVICE_CPU:
+            out.backend.device_policy = da::DevicePolicy::Cpu;
+            break;
+        case DA_CAPI_DEVICE_NAMED:
+            if (!o->device_name || !*o->device_name) return false;
+            out.backend.device_policy = da::DevicePolicy::Named;
+            out.backend.device_name = o->device_name;
+            break;
+        default:
+            return false;
+    }
+    return true;
+}
+
+static da_ctx* capi_wrap_engine(std::unique_ptr<da::Engine> e){
+    if (!e) return nullptr;
+    auto* c = new da_ctx();
+    c->device_name = e->device_name();
+    c->is_offloading = e->is_offloading();
+    c->engine = std::move(e);
+    return c;
+}
+
 extern "C" {
-int da_capi_abi_version(void){ return 11; }
+int da_capi_abi_version(void){ return 13; }
+
+void da_capi_load_options_init(da_capi_load_options* options){
+    if (options) *options = capi_default_load_options(1);
+}
+
+void da_capi_depth_model_info_init(da_capi_depth_model_info* info){
+    if (!info) return;
+    std::memset(info, 0, sizeof(*info));
+    info->struct_size = sizeof(*info);
+    info->depth_semantics = DA_CAPI_DEPTH_SEMANTICS_UNKNOWN;
+    info->depth_representation = DA_CAPI_DEPTH_REPRESENTATION_UNKNOWN;
+}
+
+int da_capi_get_depth_model_info(da_ctx* c, da_capi_depth_model_info* info){
+    if (!c || !c->engine || !info || info->struct_size < sizeof(*info)){
+        if (c) c->last_error = "depth_model_info: bad args";
+        return -1;
+    }
+    info->depth_semantics = capi_depth_semantics(*c->engine);
+    info->depth_representation = DA_CAPI_DEPTH_REPRESENTATION_Z;
+    info->camera_intrinsics_capable = capi_camera_intrinsics_capable(*c->engine) ? 1 : 0;
+    return 0;
+}
+
+void da_capi_preprocess_desc_init(da_capi_preprocess_desc* desc){
+    if (!desc) return;
+    std::memset(desc, 0, sizeof(*desc));
+    desc->struct_size = sizeof(*desc);
+    capi_identity3(desc->source_to_depth_uv);
+    capi_full_uv_rect(desc->valid_depth_uv);
+}
+
+void da_capi_depth_request_init(da_capi_depth_request* request){
+    if (!request) return;
+    std::memset(request, 0, sizeof(*request));
+    request->struct_size = sizeof(*request);
+    request->output_element_type = DA_CAPI_DEPTH_ELEMENT_F16;
+    capi_identity3(request->video_to_depth_uv);
+    capi_full_uv_rect(request->valid_depth_uv);
+}
 
 // Scene-relative TSDF fusion knobs applied by the NEXT da_capi_points_stream when
 // its fuse flag is set. voxel_frac = voxel edge as a fraction of the bbox diagonal
@@ -107,16 +226,34 @@ void da_capi_set_temporal_voxel_mesh(da_ctx* c, int enabled){
     c->temporal_voxel_mesh_enabled = (enabled != 0);
 }
 da_ctx* da_capi_load(const char* path, int n_threads){
-    if (!path) return nullptr;
-    auto e = da::Engine::load(path, n_threads);
-    if (!e) return nullptr;
-    auto* c = new da_ctx(); c->engine = std::move(e); return c;
+    da_capi_load_options options = capi_default_load_options(n_threads);
+    return da_capi_load_ex(path, &options);
 }
+
+da_ctx* da_capi_load_ex(const char* path, const da_capi_load_options* options){
+    if (!path) return nullptr;
+    da::EngineLoadOptions eo;
+    if (!capi_engine_load_options(options, eo)) return nullptr;
+    return capi_wrap_engine(da::Engine::load(path, eo));
+}
+
 da_ctx* da_capi_load_nested(const char* anyview, const char* metric, int n_threads){
+    da_capi_load_options options = capi_default_load_options(n_threads);
+    return da_capi_load_nested_ex(anyview, metric, &options);
+}
+
+da_ctx* da_capi_load_nested_ex(const char* anyview, const char* metric,
+                                const da_capi_load_options* options){
     if (!anyview || !metric) return nullptr;
-    auto e = da::Engine::load_nested(anyview, metric, n_threads);
-    if (!e) return nullptr;
-    auto* c = new da_ctx(); c->engine = std::move(e); return c;
+    da::EngineLoadOptions eo;
+    if (!capi_engine_load_options(options, eo)) return nullptr;
+    return capi_wrap_engine(da::Engine::load_nested(anyview, metric, eo));
+}
+
+const char* da_capi_device_name(const da_ctx* c){ return c ? c->device_name.c_str() : ""; }
+int da_capi_is_offloading(const da_ctx* c){ return c && c->is_offloading ? 1 : 0; }
+void* da_capi_backend_handle(da_ctx* c){
+    return (c && c->engine) ? static_cast<void*>(c->engine->backend_handle()) : nullptr;
 }
 void da_capi_free(da_ctx* c){ delete c; }
 char* da_capi_info_json(da_ctx* c){
@@ -144,6 +281,214 @@ float* da_capi_depth_path(da_ctx* c, const char* image_path, int* out_h, int* ou
     if (out_h) *out_h = H;
     if (out_w) *out_w = W;
     return p;
+}
+
+
+float* da_capi_depth_rgb8(da_ctx* c, const unsigned char* rgb, int width, int height,
+                          size_t row_stride, int* out_h, int* out_w){
+    if (!c || !c->engine || !rgb || width <= 0 || height <= 0){
+        if (c) c->last_error = "depth_rgb8: bad args";
+        return nullptr;
+    }
+    const size_t tight = (size_t)width * 3;
+    if (row_stride == 0) row_stride = tight;
+    if (row_stride < tight){ c->last_error = "depth_rgb8: row_stride too small"; return nullptr; }
+
+    da::Image img; img.w = width; img.h = height; img.rgb.resize(tight * (size_t)height);
+    for (int y = 0; y < height; ++y)
+        std::memcpy(img.rgb.data() + (size_t)y * tight, rgb + (size_t)y * row_stride, tight);
+
+    std::vector<float> depth; int H = 0, W = 0;
+    bool ok = false;
+    if (c->engine->is_nested()) {
+        da::NestedOut out;
+        ok = c->engine->depth_metric(img, out, H, W);
+        if (ok) depth = std::move(out.depth);
+    } else {
+        // Media path is depth-only: preprocess once, then use the same fused
+        // backbone+DPT graph used by the GPU-resident entry point for DA2/DA3.
+        da::Preprocessed p;
+        ok = da::preprocess_real(img, c->engine->config(), p);
+        if (ok) {
+            H = p.H; W = p.W;
+            ok = c->engine->depth_preprocessed(p.chw.data(), H, W, depth);
+        }
+        // Host path may safely fall back to the existing implementations if a
+        // backend cannot run the fused graph. The device-tensor path never does
+        // this because that would imply a full readback.
+        if (!ok) {
+            std::vector<float> aux;
+            if (c->engine->is_da2())
+                ok = c->engine->depth_relative(img, depth, H, W);
+            else if (c->engine->is_mono())
+                ok = c->engine->depth_mono(img, depth, aux, H, W);
+            else
+                ok = c->engine->depth_native_image(img, depth, aux, H, W);
+        }
+    }
+    if (!ok){ c->last_error = "depth_rgb8: inference failed"; return nullptr; }
+
+    float* out = (float*)std::malloc(depth.size() * sizeof(float));
+    if (!out){ c->last_error = "depth_rgb8: oom"; return nullptr; }
+    std::memcpy(out, depth.data(), depth.size() * sizeof(float));
+    if (out_h) *out_h = H;
+    if (out_w) *out_w = W;
+    return out;
+}
+
+float* da_capi_depth_chw_f32(da_ctx* c, const float* chw, int h, int w){
+    if (!c || !c->engine || !chw || h <= 0 || w <= 0){
+        if (c) c->last_error = "depth_chw_f32: bad args";
+        return nullptr;
+    }
+    std::vector<float> depth;
+    if (!c->engine->depth_preprocessed(chw, h, w, depth)){
+        c->last_error = "depth_chw_f32: inference failed";
+        return nullptr;
+    }
+    float* out = (float*)std::malloc(depth.size() * sizeof(float));
+    if (!out){ c->last_error = "depth_chw_f32: oom"; return nullptr; }
+    std::memcpy(out, depth.data(), depth.size() * sizeof(float));
+    return out;
+}
+
+int da_capi_depth_device_tensor_ex(da_ctx* c, void* input_tensor, int h, int w,
+                                   const da_capi_depth_request* request,
+                                   da_capi_device_depth_consumer_ex consume, void* user){
+    if (!c || !c->engine || !input_tensor || !consume || h <= 0 || w <= 0){
+        if (c) c->last_error = "depth_device_tensor_ex: bad args";
+        return -1;
+    }
+    if (!c->engine->is_offloading()){
+        c->last_error = "depth_device_tensor_ex: context is not using an accelerator backend";
+        return -1;
+    }
+
+    da_capi_depth_request req{};
+    da_capi_depth_request_init(&req);
+    if (request) {
+        if (request->struct_size < sizeof(*request)){
+            c->last_error = "depth_device_tensor_ex: request struct too small";
+            return -1;
+        }
+        req = *request;
+        if (capi_matrix_all_zero(req.video_to_depth_uv))
+            capi_identity3(req.video_to_depth_uv);
+    }
+
+    ggml_type output_type = GGML_TYPE_F32;
+    if (req.output_element_type == DA_CAPI_DEPTH_ELEMENT_F16)
+        output_type = GGML_TYPE_F16;
+    else if (req.output_element_type != DA_CAPI_DEPTH_ELEMENT_F32) {
+        c->last_error = "depth_device_tensor_ex: unsupported output element type";
+        return -1;
+    }
+
+    da_capi_device_depth_result result{};
+    result.struct_size = sizeof(result);
+    result.frame_id = req.frame_id;
+    result.pts_ns = req.pts_ns;
+    result.width = w;
+    result.height = h;
+    result.element_type = req.output_element_type;
+    result.depth_semantics = capi_depth_semantics(*c->engine);
+    result.depth_representation = DA_CAPI_DEPTH_REPRESENTATION_Z;
+    std::memcpy(result.video_to_depth_uv, req.video_to_depth_uv,
+                sizeof(result.video_to_depth_uv));
+    std::memcpy(result.valid_depth_uv, req.valid_depth_uv,
+                sizeof(result.valid_depth_uv));
+    result.has_intrinsics = 0;
+    std::memset(result.intrinsics, 0, sizeof(result.intrinsics));
+
+    auto* input = static_cast<ggml_tensor*>(input_tensor);
+    bool ok = c->engine->depth_preprocessed_device(input, h, w, output_type,
+        [&](ggml_backend_t backend, const ggml_tensor* depth) -> bool {
+            // The media/device API promises a genuinely accelerator-resident result.
+            // If ggml had to place the final op on its CPU fallback backend, fail
+            // rather than silently introducing the full depth readback that this API
+            // exists to avoid.
+            if (backend != c->engine->backend_handle()) return false;
+            return consume(user, static_cast<void*>(backend),
+                           static_cast<const void*>(depth), &result) == 0;
+        });
+    if (!ok){
+        c->last_error = "depth_device_tensor_ex: inference/consumer failed";
+        return -1;
+    }
+    return 0;
+}
+
+struct capi_compat_device_consumer {
+    da_capi_device_depth_consumer fn = nullptr;
+    void* user = nullptr;
+};
+
+static int capi_compat_device_consume(void* opaque, void* backend,
+                                      const void* depth_tensor,
+                                      const da_capi_device_depth_result*){
+    auto* c = static_cast<capi_compat_device_consumer*>(opaque);
+    return c->fn(c->user, backend, depth_tensor);
+}
+
+int da_capi_depth_device_tensor(da_ctx* c, void* input_tensor, int h, int w,
+                                da_capi_device_depth_consumer consume, void* user){
+    if (!consume){
+        if (c) c->last_error = "depth_device_tensor: bad consumer";
+        return -1;
+    }
+    da_capi_depth_request req{};
+    da_capi_depth_request_init(&req);
+    req.output_element_type = DA_CAPI_DEPTH_ELEMENT_F32;
+    capi_compat_device_consumer compat{consume, user};
+    return da_capi_depth_device_tensor_ex(c, input_tensor, h, w, &req,
+                                          capi_compat_device_consume, &compat);
+}
+
+int da_capi_get_preprocess_desc(da_ctx* c, int src_w, int src_h,
+                                da_capi_preprocess_desc* desc){
+    if (!c || !c->engine || !desc || desc->struct_size < sizeof(*desc) ||
+        src_w <= 0 || src_h <= 0){
+        if (c) c->last_error = "preprocess_desc: bad args";
+        return -1;
+    }
+    const auto& cfg = c->engine->config();
+    int w = 0, h = 0;
+    if (!da::preprocess_real_size(src_w, src_h, cfg, w, h)){
+        c->last_error = "preprocess_desc: invalid model preprocess config";
+        return -1;
+    }
+    if (cfg.img_mean.size() < 3 || cfg.img_std.size() < 3){
+        c->last_error = "preprocess_desc: missing normalization constants";
+        return -1;
+    }
+
+    desc->output_width = w;
+    desc->output_height = h;
+    for (int i = 0; i < 3; ++i) {
+        desc->mean[i] = cfg.img_mean[i];
+        desc->std[i] = cfg.img_std[i];
+    }
+
+    // preprocess_real() currently resizes the complete source image twice without
+    // crop, pad, rotate or mirror. In normalized continuous UV coordinates the
+    // source and final depth therefore share the same domain. Keep this explicit
+    // so a future preprocessing-policy change must update this contract.
+    capi_identity3(desc->source_to_depth_uv);
+    capi_full_uv_rect(desc->valid_depth_uv);
+    return 0;
+}
+
+int da_capi_preprocess_info(da_ctx* c, int src_w, int src_h,
+                            int* out_w, int* out_h, float mean3[3], float std3[3]){
+    da_capi_preprocess_desc desc{};
+    da_capi_preprocess_desc_init(&desc);
+    if (da_capi_get_preprocess_desc(c, src_w, src_h, &desc) != 0)
+        return -1;
+    if (out_w) *out_w = desc.output_width;
+    if (out_h) *out_h = desc.output_height;
+    if (mean3) std::memcpy(mean3, desc.mean, sizeof(desc.mean));
+    if (std3)  std::memcpy(std3,  desc.std,  sizeof(desc.std));
+    return 0;
 }
 void da_capi_free_floats(float* p){ std::free(p); }
 int da_capi_pose_path(da_ctx* c, const char* image_path, float out_ext[12], float out_intr[9]){

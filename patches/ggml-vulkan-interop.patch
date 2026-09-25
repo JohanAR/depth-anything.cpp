@@ -1,0 +1,123 @@
+diff --git a/include/ggml-vulkan.h b/include/ggml-vulkan.h
+index ed5ea5f7..0ad19516 100644
+--- a/include/ggml-vulkan.h
++++ b/include/ggml-vulkan.h
+@@ -2,6 +2,7 @@
+ 
+ #include "ggml.h"
+ #include "ggml-backend.h"
++#include <vulkan/vulkan_core.h>
+ 
+ #ifdef  __cplusplus
+ extern "C" {
+@@ -13,6 +14,30 @@ extern "C" {
+ // backend API
+ GGML_BACKEND_API ggml_backend_t ggml_backend_vk_init(size_t dev_num);
+ 
++// Minimal native interop used by embedding applications. ggml keeps ownership
++// of the VkDevice and its queue synchronization.
++struct ggml_backend_vk_native_context {
++    VkPhysicalDevice physical_device;
++    VkDevice device;
++    uint32_t compute_queue_family_index;
++    VkBool32 storage_buffer_16bit;
++    VkBool32 timeline_semaphore;
++    VkBool32 shader_float16;
++    VkBool32 shader_float64;
++};
++
++GGML_BACKEND_API bool ggml_backend_vk_get_native_context(
++    ggml_backend_t backend,
++    struct ggml_backend_vk_native_context * context);
++GGML_BACKEND_API VkResult ggml_backend_vk_submit(
++    ggml_backend_t backend,
++    uint32_t submit_count,
++    const VkSubmitInfo * submits,
++    VkFence fence);
++GGML_BACKEND_API bool ggml_backend_vk_get_tensor_buffer(
++    const struct ggml_tensor * tensor,
++    VkBuffer * buffer, size_t * offset, size_t * size);
++
+ GGML_BACKEND_API bool ggml_backend_is_vk(ggml_backend_t backend);
+ GGML_BACKEND_API int  ggml_backend_vk_get_device_count(void);
+ GGML_BACKEND_API void ggml_backend_vk_get_device_description(int device, char * description, size_t description_size);
+diff --git a/src/ggml-vulkan/ggml-vulkan.cpp b/src/ggml-vulkan/ggml-vulkan.cpp
+index b3a7cb6a..a946fd71 100644
+--- a/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -16960,6 +16960,23 @@ static bool ggml_backend_buffer_is_vk(ggml_backend_buffer_t buffer) {
+     return buffer->buft->iface.get_name == ggml_backend_vk_buffer_type_name;
+ }
+ 
++bool ggml_backend_vk_get_tensor_buffer(
++        const ggml_tensor * tensor, VkBuffer * buffer, size_t * offset, size_t * size) {
++    if (tensor == nullptr || tensor->buffer == nullptr || buffer == nullptr ||
++        offset == nullptr || size == nullptr || !ggml_backend_buffer_is_vk(tensor->buffer)) {
++        return false;
++    }
++
++    auto * buf_ctx = (ggml_backend_vk_buffer_context *) tensor->buffer->context;
++    if (buf_ctx == nullptr || buf_ctx->dev_buffer == nullptr) {
++        return false;
++    }
++    *buffer = static_cast<VkBuffer>(buf_ctx->dev_buffer->buffer);
++    *offset = (size_t) (vk_tensor_offset(tensor) + tensor->view_offs);
++    *size = ggml_nbytes(tensor);
++    return true;
++}
++
+ static void ggml_backend_vk_buffer_free_buffer(ggml_backend_buffer_t buffer) {
+     VK_LOG_MEMORY("ggml_backend_vk_buffer_free_buffer()");
+     ggml_backend_vk_buffer_context * ctx = (ggml_backend_vk_buffer_context *)buffer->context;
+@@ -19186,6 +19203,51 @@ bool ggml_backend_is_vk(ggml_backend_t backend) {
+     return backend != NULL && ggml_guid_matches(backend->guid, ggml_backend_vk_guid());
+ }
+ 
++bool ggml_backend_vk_get_native_context(
++        ggml_backend_t backend, ggml_backend_vk_native_context * out) {
++    if (!ggml_backend_is_vk(backend) || out == nullptr) {
++        return false;
++    }
++    auto * ctx = (ggml_backend_vk_context *) backend->context;
++    if (ctx == nullptr || ctx->device == nullptr || ctx->device->compute_queue == nullptr) {
++        return false;
++    }
++
++    out->physical_device = static_cast<VkPhysicalDevice>(ctx->device->physical_device);
++    out->device = static_cast<VkDevice>(ctx->device->device);
++    out->compute_queue_family_index = ctx->device->compute_queue->queue_family_index;
++    // These are prerequisites of the current ggml Vulkan backend itself.
++    out->storage_buffer_16bit = VK_TRUE;
++    out->timeline_semaphore = VK_TRUE;
++    out->shader_float16 = ctx->device->fp16 ? VK_TRUE : VK_FALSE;
++    // Device creation enables the queried core physical-device features.
++    out->shader_float64 = ctx->device->physical_device.getFeatures().shaderFloat64;
++    return true;
++}
++
++VkResult ggml_backend_vk_submit(
++        ggml_backend_t backend, uint32_t submit_count,
++        const VkSubmitInfo * submits, VkFence fence) {
++    if (!ggml_backend_is_vk(backend) || (submit_count != 0 && submits == nullptr)) {
++        return VK_ERROR_INITIALIZATION_FAILED;
++    }
++    auto * ctx = (ggml_backend_vk_context *) backend->context;
++    if (ctx == nullptr || ctx->device == nullptr || ctx->device->compute_queue == nullptr) {
++        return VK_ERROR_INITIALIZATION_FAILED;
++    }
++
++    // Use the same synchronization object as ggml's own submissions. Do not
++    // expose the raw VkQueue to the embedding application.
++    auto & handle = ctx->device->compute_queue->handle;
++    std::lock_guard<vk_queue_handle> guard(*handle);
++    const VkResult result = vkQueueSubmit(
++        static_cast<VkQueue>(handle->queue), submit_count, submits, fence);
++    if (result == VK_ERROR_DEVICE_LOST) {
++        ggml_vk_print_device_lost_info(ctx->device);
++    }
++    return result;
++}
++
+ int ggml_backend_vk_get_device_count() {
+     return ggml_vk_get_device_count();
+ }

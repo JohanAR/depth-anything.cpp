@@ -154,6 +154,26 @@ static inline int nearest_multiple(int x, int p){
     return (std::abs(up-x) <= std::abs(x-down)) ? up : down;
 }
 
+bool preprocess_real_size(int src_w, int src_h, const Config& cfg, int& out_w, int& out_h){
+    if (src_w <= 0 || src_h <= 0) return false;
+    const int patch  = (int)cfg.patch_size;
+    const int target = cfg.img_resize_target>0 ? (int)cfg.img_resize_target : 504;
+    if (patch <= 0 || target <= 0) return false;
+    const bool upper = cfg.img_resize_mode.rfind("lower",0)!=0;
+
+    int w = src_w, h = src_h;
+    const int bound = upper ? std::max(w,h) : std::min(w,h);
+    if (bound != target) {
+        const double scale = (double)target / bound;
+        w = std::max(1, py_round(w*scale));
+        h = std::max(1, py_round(h*scale));
+    }
+    w = std::max(1, nearest_multiple(w, patch));
+    h = std::max(1, nearest_multiple(h, patch));
+    out_w = w; out_h = h;
+    return true;
+}
+
 bool preprocess_real(const Image& img, const Config& cfg, Preprocessed& out,
                      std::vector<uint8_t>* rgb_u8_out){
     if (img.w<=0 || img.h<=0 || cfg.img_mean.size()<3 || cfg.img_std.size()<3) return false;

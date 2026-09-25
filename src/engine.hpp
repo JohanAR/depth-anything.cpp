@@ -8,8 +8,15 @@
 #include <string>
 #include <vector>
 #include <array>
+#include <functional>
 
 namespace da {
+
+struct EngineLoadOptions {
+    int n_threads = 1;
+    BackendOptions backend;
+};
+
 enum class TaskMode { DEPTH, DEPTH_POSE, MULTIVIEW, RECONSTRUCT, NESTED_METRIC };
 
 // Per-view result of the multi-view pipeline.
@@ -22,11 +29,19 @@ struct ViewResult {
 class Engine {
 public:
     static std::unique_ptr<Engine> load(const std::string& gguf_path, int n_threads);
+    static std::unique_ptr<Engine> load(const std::string& gguf_path,
+                                        const EngineLoadOptions& options);
     // Nested metric: loads BOTH the anyview (GIANT) GGUF and the metric (ViT-L
     // + DPT/sky) GGUF. depth_metric() then runs both branches + alignment.
     static std::unique_ptr<Engine> load_nested(const std::string& anyview_gguf,
                                                const std::string& metric_gguf, int n_threads);
+    static std::unique_ptr<Engine> load_nested(const std::string& anyview_gguf,
+                                               const std::string& metric_gguf,
+                                               const EngineLoadOptions& options);
     const Config& config() const { return ml_.config(); }
+    const std::string& device_name() const { return be_.device_name(); }
+    bool is_offloading() const { return be_.is_offloading(); }
+    ggml_backend_t backend_handle() const { return be_.handle(); }
     // True iff this engine was created via load_nested() (anyview + metric
     // branches both loaded). depth_metric() is then the valid inference path.
     bool is_nested() const { return metric_ml_ != nullptr; }
@@ -44,6 +59,17 @@ public:
     bool depth_relative(const Image& img, std::vector<float>& depth_out, int& H, int& W);
     bool depth_relative_path(const std::string& image_path, std::vector<float>& depth_out,
                              int& H, int& W);
+    // Depth-only fast path for media integration. The input is already resized
+    // and normalized CHW F32 at model resolution, so no image decode/CPU resize is
+    // performed. Backbone + DPT + final depth activation run as ONE ggml graph for
+    // both DA2 and DA3 single-image models.
+    bool depth_preprocessed(const float* chw, int H, int W, std::vector<float>& depth_out);
+    // Same graph with an already backend-resident [W,H,3,1] F32 tensor. The callback
+    // runs after compute while the output depth tensor [W,H] is still resident. It
+    // must copy/consume it synchronously and must not retain the ggml_tensor pointer.
+    bool depth_preprocessed_device(
+        ggml_tensor* input_chw, int H, int W, ggml_type output_type,
+        const std::function<bool(ggml_backend_t, const ggml_tensor*)>& consume);
     // M1: debug entry returning backbone features for out_layers (filled in T16).
     bool backbone_features(const std::vector<float>& input_image, int H, int W,
                            std::vector<std::vector<float>>& feats_out);
@@ -115,10 +141,15 @@ public:
     bool metric_branch(const Image& img, std::vector<float>& depth_raw,
                        std::vector<float>& sky, int& H, int& W);
 private:
+    explicit Engine(const BackendOptions& backend_options) : be_(backend_options) {}
+    ggml_tensor* build_depth_only_graph(ggml_context* ctx, ggml_tensor* input_chw,
+                                        int H, int W, GraphInputPool& pool,
+                                        ggml_type output_type = GGML_TYPE_F32);
     // Fused single-image depth: backbone feats + DPT head built into ONE ggml graph
     // (feats stay device-resident — no GPU->host->GPU round-trip). Parity-exact with
-    // the unfused path. cat_token=true only; depth_native_image falls back to unfused
-    // otherwise or when DA_FUSED=0. The unfused variant keeps the original two-graph
+    // the unfused path. The media depth-only path supports both cat_token=true
+    // and cat_token=false; depth_native_image keeps its existing DA_FUSED A/B policy.
+    // The unfused variant keeps the original two-graph
     // path (used by ctest's separate backbone/head gates, A/B, and as fallback).
     bool depth_native_fused(const Image& img, std::vector<float>& depth_out,
                             std::vector<float>& conf_out, int& H, int& W);

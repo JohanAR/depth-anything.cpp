@@ -215,8 +215,16 @@ bool DinoBackbone::forward(const std::vector<float>& input_chw, int H, int W,
 
 bool DinoBackbone::build_feats_graph(ggml_context* ctx, const std::vector<float>& input_chw,
                                      int H, int W, GraphInputPool& pool, ggml_tensor* out_feat[4]){
+    const int64_t ine[4] = { W, H, 3, 1 };
+    ggml_tensor* img = be_.add_graph_input_nd(ctx, pool, input_chw.data(), ine, 4);
+    return build_feats_graph(ctx, img, H, W, pool, out_feat);
+}
+
+bool DinoBackbone::build_feats_graph(ggml_context* ctx, ggml_tensor* input_chw,
+                                     int H, int W, GraphInputPool& pool, ggml_tensor* out_feat[4]){
     const auto& c = ml_.config();
-    if (!c.cat_token) return false;   // fused path is the cat_token=true (BASE/giant) case only
+    if (!input_chw || input_chw->ne[0] != W || input_chw->ne[1] != H ||
+        input_chw->ne[2] != 3) return false;
     const int patch=(int)c.patch_size, gh=H/patch, gw=W/patch;
     const int embed=(int)c.embed_dim, heads=(int)c.num_heads, hd=(int)c.head_dim;
     const int Npatch=gh*gw, Ntok=1+Npatch;
@@ -253,9 +261,8 @@ bool DinoBackbone::build_feats_graph(ggml_context* ctx, const std::vector<float>
     }
 
     // --- prepare tokens (same graph as forward()) ---
-    const int64_t ine[4]={W,H,3,1};
-    ggml_tensor* img = be_.add_graph_input_nd(ctx, pool, input_chw.data(), ine, 4);
-    ggml_tensor* x = ggml_conv_2d(ctx, ml_.tensor("vit.patch_embed.weight"), img, patch,patch,0,0,1,1);
+    ggml_tensor* x = ggml_conv_2d(ctx, ml_.tensor("vit.patch_embed.weight"), input_chw,
+                                  patch,patch,0,0,1,1);
     x = ggml_reshape_2d(ctx, x, (int64_t)Npatch, embed);
     x = ggml_cont(ctx, ggml_transpose(ctx, x));
     x = ggml_add(ctx, x, ml_.tensor("vit.patch_embed.bias"));
@@ -290,14 +297,20 @@ bool DinoBackbone::build_feats_graph(ggml_context* ctx, const std::vector<float>
         x = vit_block(ctx, x, bw, heads, hd, eps, cb, sb);
         if (!global) local_x = x;
         for (size_t o=0;o<NL && o<4;++o) if (outL[o]==i){
-            // feat = cat([local_x_raw, layernorm(x)], dim0), then strip token-0.
-            // Layout matches forward()'s host post-process exactly: channel 0..embed-1
-            // = local_x RAW, embed..2*embed-1 = vit.norm(x); token-major channel-minor.
             ggml_tensor* normed = layernorm(ctx, x, nw, nb, eps);
-            ggml_tensor* fcat   = ggml_concat(ctx, local_x, normed, 0);   // [2*embed, Ntok]
-            ggml_tensor* fstr   = ggml_cont(ctx, ggml_view_2d(ctx, fcat, 2*(int64_t)embed,
-                                                Npatch, fcat->nb[1], fcat->nb[1]));
-            out_feat[o] = fstr;                                            // [2*embed, Npatch]
+            if (c.cat_token) {
+                // DA3 any-view: feat = cat([local_x_raw, layernorm(x)], dim0),
+                // then strip token-0. Layout matches forward()'s host post-process.
+                ggml_tensor* fcat = ggml_concat(ctx, local_x, normed, 0); // [2E,Ntok]
+                out_feat[o] = ggml_cont(ctx, ggml_view_2d(ctx, fcat,
+                    2*(int64_t)embed, Npatch, fcat->nb[1], fcat->nb[1])); // [2E,Npatch]
+            } else {
+                // DA2 and DA3 mono/metric: get_intermediate_layers returns only
+                // vit.norm(x), with cls token removed. Keeping this in the same
+                // graph avoids the old GPU->CPU feature readback + CPU->GPU upload.
+                out_feat[o] = ggml_cont(ctx, ggml_view_2d(ctx, normed,
+                    (int64_t)embed, Npatch, normed->nb[1], normed->nb[1])); // [E,Npatch]
+            }
         }
     }
     return true;

@@ -3,7 +3,35 @@
 #include <cstdio>
 #include <cstring>
 int main(){
-    if (da_capi_abi_version() != 11) return 1;
+    if (da_capi_abi_version() != 13) return 1;
+
+    da_capi_depth_request req;
+    da_capi_depth_request_init(&req);
+    if (req.struct_size != sizeof(req) ||
+        req.output_element_type != DA_CAPI_DEPTH_ELEMENT_F16 ||
+        req.video_to_depth_uv[0] != 1.f ||
+        req.video_to_depth_uv[4] != 1.f ||
+        req.video_to_depth_uv[8] != 1.f ||
+        req.valid_depth_uv[0] != 0.f ||
+        req.valid_depth_uv[1] != 0.f ||
+        req.valid_depth_uv[2] != 1.f ||
+        req.valid_depth_uv[3] != 1.f) return 1;
+
+    da_capi_preprocess_desc pd;
+    da_capi_preprocess_desc_init(&pd);
+    if (pd.struct_size != sizeof(pd) ||
+        pd.source_to_depth_uv[0] != 1.f ||
+        pd.source_to_depth_uv[4] != 1.f ||
+        pd.source_to_depth_uv[8] != 1.f ||
+        pd.valid_depth_uv[2] != 1.f ||
+        pd.valid_depth_uv[3] != 1.f) return 1;
+
+    da_capi_depth_model_info mi;
+    da_capi_depth_model_info_init(&mi);
+    if (mi.struct_size != sizeof(mi) ||
+        mi.depth_semantics != DA_CAPI_DEPTH_SEMANTICS_UNKNOWN ||
+        mi.depth_representation != DA_CAPI_DEPTH_REPRESENTATION_UNKNOWN) return 1;
+
     const char* gguf = std::getenv("DA_TEST_GGUF");
     if (!gguf) return 77;
     da_ctx* c = da_capi_load(gguf, 1);

@@ -29,6 +29,10 @@ bool preprocess(const Image& img, const Config& cfg, Preprocessed& out);
 // COLMAP exporters need, guaranteed identical to the model-input resize.
 bool preprocess_real(const Image& img, const Config& cfg, Preprocessed& out,
                      std::vector<uint8_t>* rgb_u8_out = nullptr);
+// Geometry-only counterpart of preprocess_real(). Useful for GPU preprocessors:
+// computes the exact processed W/H (including Python rounding + patch rounding)
+// without touching pixel data.
+bool preprocess_real_size(int src_w, int src_h, const Config& cfg, int& out_w, int& out_h);
 
 // cv2-faithful uint8 resizers (HWC RGB uint8 -> HWC RGB uint8).
 Image resize_cubic(const Image& src, int dw, int dh);  // INTER_CUBIC, a=-0.75

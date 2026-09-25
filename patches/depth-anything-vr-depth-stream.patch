@@ -1,0 +1,1666 @@
+diff --git a/docs/GPU.md b/docs/GPU.md
+index 54de57b..5aada59 100644
+--- a/docs/GPU.md
++++ b/docs/GPU.md
+@@ -78,10 +78,12 @@ When a non-CPU device is selected (`Backend::is_offloading()` true),
+ 
+ ### GPU-friendly op routing
+ 
+-After a successful offload, `Engine::load` calls `da::set_gpu_mode(true)`
+-(see `src/compute_mode.hpp`). In GPU mode the graph builders route to **standard
+-ggml ops that have CUDA kernels**, instead of the CPU-tuned custom paths that
+-would force GPU↔CPU round-trips:
++`Backend::compute()` scopes `gpu_mode()` to the backend executing that graph
++(see `src/compute_mode.hpp`). The flag is thread-local, so an explicitly forced
++CPU context and a Vulkan/CUDA/Metal context may coexist and execute concurrently
++without changing each other's graph construction. In GPU mode the graph builders
++route to **standard ggml ops that have accelerator kernels**, instead of the
++CPU-tuned custom paths that would force GPU↔CPU round-trips:
+ 
+ - **Conv (`src/dpt_blocks.cpp`)** — 3×3 stride-1 convs use
+   `ggml_conv_2d_direct` (CUDA kernel) instead of the CPU-only Winograd custom op
+@@ -133,3 +135,12 @@ GPU→host→GPU round-trip and a second graph setup. The out-layer post-process
+ Parity: fused vs unfused depth max|d|=1.2e-7 (CPU); CPU-vs-GPU corr=0.999998. On the **unified**
+ GB10 it's latency-neutral (160 vs 160 ms — the round-trip was already cheap); the win is for
+ **discrete** (PCIe) GPUs where the feats round-trip is a real copy. No regression anywhere; 31/31 tests.
++
++## Embedded media-player device selection
++
++The C API also supports per-context selection without mutating `DA_DEVICE`:
++`da_capi_load_ex()` accepts `DA_CAPI_DEVICE_DEFAULT`, `AUTO`, `CPU`, or `NAMED`.
++This is useful for applications that expose an explicit "run depth on CPU/GPU"
++setting, and allows CPU and accelerator contexts to coexist in one process.
++
++For depth-only video/photo integration, see `docs/VR_MEDIA_INTEGRATION.md`.
+diff --git a/docs/VR_MEDIA_INTEGRATION.md b/docs/VR_MEDIA_INTEGRATION.md
+new file mode 100644
+index 0000000..e97759c
+--- /dev/null
++++ b/docs/VR_MEDIA_INTEGRATION.md
+@@ -0,0 +1,311 @@
++# VR / real-time media depth integration
++
++This document defines the media-player boundary for generated depth. The depth
++library is a **depth side-stream producer**. It does not create left/right RGB,
++SBS frames, or otherwise modify the presentation image.
++
++The source video and generated depth remain independent streams:
++
++```text
++                         +-------------------------------> original RGB/video
++                         |                                      to Godot/XR
++GPU decoded video frame -+
++                         |
++                         +-> async Depth Anything producer
++                                      |
++                                      +-------------------> timestamped depth
++                                                           to Godot/XR
++```
++
++Godot/OpenXR owns the stereo reconstruction policy. It may use cheap disparity
++warping, a depth mesh, DIBR, or a future reconstruction method without changing
++or rerunning depth inference.
++
++## Responsibilities
++
++The Depth Anything integration is responsible for:
++
++* explicit CPU/accelerator selection;
++* accepting a GPU video frame through a thin Vulkan adapter;
++* creating a reduced-resolution normalized inference input;
++* running depth inference without a full-frame CPU round-trip;
++* publishing a GPU-resident depth result, preferably F16 for video;
++* attaching the source frame ID and PTS to every depth result;
++* publishing an explicit video-UV -> depth-UV transform and valid UV region;
++* reporting whether depth is relative or metric and its representation;
++* keeping inference off the playback/OpenXR critical path;
++* bounded/latest-wins pending work when inference cannot keep up;
++* retaining only a small timestamped ring of completed depth frames.
++
++It is deliberately **not** responsible for:
++
++* generating left/right RGB images;
++* generating SBS/OU video frames;
++* deciding eye separation or convergence;
++* performing per-eye image warping or DIBR;
++* delaying playback until depth is available.
++
++## Device selection and CPU fallback
++
++The legacy API keeps its current behavior:
++
++```c
++da_ctx * ctx = da_capi_load("model.gguf", 8);
++```
++
++It still honors `DA_DEVICE`. Embedders should normally use explicit per-context
++selection:
++
++```c
++da_capi_load_options opts;
++da_capi_load_options_init(&opts);
++opts.n_threads = 8;
++
++opts.device_policy = DA_CAPI_DEVICE_CPU;   // force CPU
++opts.device_policy = DA_CAPI_DEVICE_AUTO;  // GPU/iGPU then CPU
++opts.device_policy = DA_CAPI_DEVICE_NAMED;
++opts.device_name = "Vulkan0";
++
++da_ctx * ctx = da_capi_load_ex("model.gguf", &opts);
++```
++
++CPU execution remains a first-class path. A media player may expose backend
++choice directly to the user and may fall back to CPU when Vulkan interop is not
++available.
++
++## Model and preprocessing metadata
++
++Use `da_capi_get_depth_model_info()` to query:
++
++* relative vs metric-metre depth;
++* depth representation (`Z` for the current single-image paths);
++* whether the model's full pipeline has a camera-intrinsics path.
++
++Use `da_capi_get_preprocess_desc()` to query the model input size and ImageNet
++normalization constants for a source frame. It also returns
++`source_to_depth_uv[9]` and `valid_depth_uv[4]`.
++
++The current `preprocess_real()` policy only resizes the complete image. It does
++not crop, pad, rotate, or mirror it, so normalized source UV and normalized depth
++UV are currently identical. The transform is nevertheless explicit so a future
++preprocessing change cannot silently misalign RGB and depth.
++
++The Vulkan media adapter must compose any transformation it performs before
++inference -- decoder crop, display-aspect correction, rotation metadata,
++mirroring, etc. -- into the final `video_to_depth_uv` matrix carried with the
++result.
++
++UV convention should be kept consistent across the media adapter and renderer:
++
++```text
++(0,0) = top-left image edge
++(1,1) = bottom-right image edge
++pixel centre = ((x + 0.5) / width, (y + 0.5) / height)
++```
++
++## GPU-resident depth-only entry point
++
++The core library exposes a backend-resident inference hook rather than Vulkan
++handles directly:
++
++```c
++da_capi_depth_request req;
++da_capi_depth_request_init(&req);
++req.frame_id = frame_id;
++req.pts_ns = pts_ns;
++req.output_element_type = DA_CAPI_DEPTH_ELEMENT_F16;
++memcpy(req.video_to_depth_uv, video_to_depth_uv, sizeof(req.video_to_depth_uv));
++
++int r = da_capi_depth_device_tensor_ex(
++    ctx,
++    input_tensor,      // ggml_tensor*: normalized F32 [W,H,3,1], already on backend
++    H, W,
++    &req,
++    consume_depth,
++    user);
++```
++
++The call runs backbone + DPT + final model-specific activation as one graph and
++invokes the consumer while the final tensor is still backend-resident. No final
++`ggml_backend_tensor_get()` is performed.
++
++The result metadata includes:
++
++```text
++frame_id
++pts_ns
++width / height
++F16 or F32 element type
++relative / metric semantics
++Z-depth representation
++video_to_depth_uv
++valid_depth_uv
++optional intrinsics fields
++```
++
++The current depth-only fast path does not run the additional camera head, so its
++per-frame result has `has_intrinsics == 0`. `camera_intrinsics_capable` from the
++model-info query tells an adapter whether a more expensive/full model path could
++provide them in the future.
++
++F16 output is intended for the real-time bridge: the graph casts the final depth
++tensor to F16 on-device, allowing a direct GPU copy into an external buffer that
++can be interpreted as `R16_SFLOAT`. F32 remains available for debugging and
++consumers that require it.
++
++## Asynchronous producer
++
++`da_capi_depth_device_tensor_ex()` is intentionally synchronous **only with
++respect to the inference worker thread**. The Vulkan/media wrapper owns the
++asynchronous producer around it.
++
++Recommended producer state:
++
++```text
++1 active inference
++1 replaceable pending candidate
++3-5 completed timestamped depth results
++```
++
++When depth inference is keeping up, process buffered source frames in PTS order.
++When it falls behind, replace stale pending work with the newest useful frame.
++Never build an inference FIFO that attempts to catch up by processing old video
++frames.
++
++A completed result is immutable until its output-ring slot is recycled. For a
++rendered video frame at PTS `T`, the renderer should normally select:
++
++1. exact depth for `T`, if ready;
++2. otherwise the newest completed depth with `depth_pts <= T`.
++
++A future renderer may interpolate/reproject between entries in the small result
++ring. It must never require OpenXR presentation to wait for depth.
++
++Photos use the same producer without stale-frame dropping: one submitted image
++can remain pending until its depth result is available.
++
++## Recommended Vulkan wrapper contract
++
++The thin player-facing wrapper built on the core API should expose a contract of
++this shape (names are illustrative):
++
++```cpp
++struct VideoDepthInput {
++    VkImage image;
++    uint32_t width, height;
++    VkImageLayout layout;
++    uint64_t frame_id;
++    int64_t pts_ns;
++    VkSemaphore ready_semaphore;
++    uint64_t ready_value;
++    Mat3 video_to_image_uv;
++};
++
++struct VideoDepthResult {
++    VkBuffer depth_buffer;       // F16 by default; image view may be layered on top
++    VkDeviceSize offset;
++    uint32_t width, height;
++    VkFormat format;             // normally VK_FORMAT_R16_SFLOAT
++    uint64_t frame_id;
++    int64_t pts_ns;
++    Mat3 video_to_depth_uv;
++    Vec4 valid_depth_uv;
++    DepthSemantics semantics;
++    DepthRepresentation representation;
++    bool has_intrinsics;
++    Mat3 intrinsics;
++    VkSemaphore ready_semaphore;
++    uint64_t ready_value;
++};
++
++DepthSubmitResult submit(const VideoDepthInput& frame);
++bool try_acquire_latest(int64_t not_after_pts_ns, VideoDepthResult& out);
++void release(const VideoDepthResult& result);
++```
++
++`submit()` must not wait for inference. A pending frame may be replaced by a
++newer one. `try_acquire_latest()` selects a completed depth result without
++blocking and never returns a result from the future relative to the requested
++video PTS. The returned Vulkan resource remains valid until `release()`.
++
++The wrapper may preprocess every submitted frame immediately into a small input
++slot, or delay preprocessing until a frame is selected for inference; either is
++valid as long as source-image lifetime and queue synchronization are explicit.
++The expensive model inference itself must remain latest-wins rather than FIFO.
++
++## Vulkan bridge
++
++For the current player architecture, assume three logical Vulkan devices on the
++same physical GPU:
++
++```text
++A = media/decode device
++D = ggml / Depth Anything device
++G = Godot/OpenXR device
++```
++
++The intended GPU-only path is:
++
++```text
++full-resolution decoded image on A
++    -> resize / RGB conversion / normalization on A
++    -> small external input buffer
++    -> GPU copy into persistent ggml input tensor on D
++    -> depth-anything.cpp fused inference on D
++    -> F16/F32 backend-resident depth tensor
++    -> GPU copy into external output-ring buffer
++    -> imported/bridged depth resource for G
++
++original full-resolution RGB follows its existing A -> G path independently
++```
++
++Only the reduced model input and low-resolution depth stream cross the depth
++bridge. The original video frame does not need to pass through ggml.
++
++A GPU->GPU staging copy is fine. The normal path should avoid full-frame or
++full-depth GPU->CPU->GPU transfers.
++
++The previously developed generic ggml Vulkan interop hooks are a suitable basis:
++
++* enable `VK_KHR_external_memory_fd` / `VK_KHR_external_semaphore_fd` when
++  available on ggml's Vulkan device;
++* expose the ggml `VkDevice`, physical device and compute queue family;
++* submit bridge copies through ggml's own queue synchronization;
++* expose the `VkBuffer`/offset/size backing a backend-resident ggml tensor.
++
++Those hooks allow app-owned external bridge buffers while leaving ggml's own
++allocator and graph memory private.
++
++The source archive used for this patch contains an empty `third_party/ggml`
++submodule directory. Therefore the model-library side of the contract is included
++here, while the concrete external-FD/timeline-semaphore Vulkan adapter must be
++built against the exact populated ggml submodule revision.
++
++## Separation of concerns
++
++The intended final layering is:
++
++```text
++DepthAnything model/core
++    model loading
++    CPU/GPU selection
++    fused depth graph
++    backend-resident depth tensor + metadata
++             |
++             v
++Vulkan depth producer
++    VkImage preprocessing
++    A <-> D external-memory/semaphore bridge
++    inference worker
++    latest-wins pending job
++    timestamped completed-depth ring
++             |
++             v
++Godot/XR renderer
++    independent original RGB stream
++    depth selection/interpolation
++    disparity warp / depth mesh / DIBR
++    per-eye OpenXR rendering
++```
++
++No layer below Godot/XR creates stereo RGB output.
+diff --git a/include/da_capi.h b/include/da_capi.h
+index f3ebb53..f4a72ae 100644
+--- a/include/da_capi.h
++++ b/include/da_capi.h
+@@ -1,6 +1,7 @@
+ #ifndef DA_CAPI_H
+ #define DA_CAPI_H
+ #include <stddef.h>
++#include <stdint.h>
+ #ifdef __cplusplus
+ extern "C" {
+ #endif
+@@ -19,8 +20,86 @@ typedef struct da_ctx da_ctx;
+    10: added da_capi_set_fuse_params — scene-relative TSDF voxel/truncation knobs for
+       the next streamed fuse (exposed as viewer sliders).
+    11: added temporal exposed-face voxel mesh generation and retrieval for streamed
+-      fused scenes. */
++      fused scenes.
++   12: added explicit per-context compute-device selection and raw/preprocessed
++      single-image depth entry points for embedded media pipelines.
++   13: added timestamped GPU depth-result metadata, UV transforms, depth semantics,
++      model/preprocess descriptors, and F16 device output for asynchronous media
++      depth side-stream producers. */
+ int         da_capi_abi_version(void);
++
++/* Device selection for da_capi_load_ex / da_capi_load_nested_ex. DEFAULT keeps
++   the historical DA_DEVICE environment-variable behaviour. AUTO ignores it and
++   chooses GPU/IGPU then CPU. CPU explicitly forces CPU even in a GPU-enabled
++   build. NAMED selects a ggml registry device by name (e.g. "Vulkan0"). */
++enum {
++    DA_CAPI_DEVICE_DEFAULT = 0,
++    DA_CAPI_DEVICE_AUTO    = 1,
++    DA_CAPI_DEVICE_CPU     = 2,
++    DA_CAPI_DEVICE_NAMED   = 3,
++};
++typedef struct da_capi_load_options {
++    size_t      struct_size;
++    int         n_threads;
++    int         device_policy;
++    const char* device_name; /* only used with DA_CAPI_DEVICE_NAMED */
++} da_capi_load_options;
++void        da_capi_load_options_init(da_capi_load_options* options);
++da_ctx*     da_capi_load_ex(const char* gguf_path, const da_capi_load_options* options);
++da_ctx*     da_capi_load_nested_ex(const char* anyview_gguf, const char* metric_gguf,
++                                   const da_capi_load_options* options);
++const char* da_capi_device_name(const da_ctx* ctx); /* owned by ctx */
++int         da_capi_is_offloading(const da_ctx* ctx);
++
++/* Depth metadata used by real-time media integrations. "Metric meters" means the
++   produced scalar is intended to represent camera-space depth in metres. */
++enum {
++    DA_CAPI_DEPTH_SEMANTICS_UNKNOWN       = 0,
++    DA_CAPI_DEPTH_SEMANTICS_RELATIVE      = 1,
++    DA_CAPI_DEPTH_SEMANTICS_METRIC_METERS = 2,
++};
++enum {
++    DA_CAPI_DEPTH_REPRESENTATION_UNKNOWN = 0,
++    DA_CAPI_DEPTH_REPRESENTATION_Z       = 1,
++};
++enum {
++    DA_CAPI_DEPTH_ELEMENT_F32 = 0,
++    DA_CAPI_DEPTH_ELEMENT_F16 = 1,
++};
++
++typedef struct da_capi_depth_model_info {
++    size_t struct_size;
++    int depth_semantics;
++    int depth_representation;
++    /* Non-zero when the model's full image pipeline has a camera-intrinsics path.
++       The depth-only device-tensor entry point does not run that additional path. */
++    int camera_intrinsics_capable;
++} da_capi_depth_model_info;
++void da_capi_depth_model_info_init(da_capi_depth_model_info* info);
++int  da_capi_get_depth_model_info(da_ctx* ctx, da_capi_depth_model_info* info);
++
++/* Exact resize/normalization contract for a source image. source_to_depth_uv is a
++   normalized homogeneous 3x3 transform from the source image UV domain to the
++   model depth UV domain. Current preprocess_real() resizes the complete image and
++   therefore returns identity; making it explicit prevents future crop/pad changes
++   from silently misaligning renderer depth. valid_depth_uv = {min_u,min_v,max_u,max_v}. */
++typedef struct da_capi_preprocess_desc {
++    size_t struct_size;
++    int output_width;
++    int output_height;
++    float mean[3];
++    float std[3];
++    float source_to_depth_uv[9];
++    float valid_depth_uv[4];
++} da_capi_preprocess_desc;
++void da_capi_preprocess_desc_init(da_capi_preprocess_desc* desc);
++int  da_capi_get_preprocess_desc(da_ctx* ctx, int src_w, int src_h,
++                                 da_capi_preprocess_desc* desc);
++
++/* Advanced interop only: borrowed ggml_backend_t as an opaque pointer, valid until
++   da_capi_free(ctx). This lets a backend-specific adapter import/allocate persistent
++   device tensors without exposing ggml headers through this C API. */
++void*       da_capi_backend_handle(da_ctx* ctx);
+ /* Set scene-relative TSDF surface-fusion knobs consumed by the NEXT
+    da_capi_points_stream whose fuse flag is set. voxel_frac: voxel edge as a fraction
+    of the reconstruction's bbox diagonal (fusion detail; <=0 => 0.004). trunc_mult:
+@@ -46,6 +125,70 @@ const char* da_capi_last_error(da_ctx* ctx);                     /* owned by ctx
+ /* Run depth on an image file. On success writes *out_h,*out_w and returns a malloc'd
+    float[H*W] depth map (row-major); caller frees via da_capi_free_floats. NULL on error. */
+ float* da_capi_depth_path(da_ctx* ctx, const char* image_path, int* out_h, int* out_w);
++/* CPU/host-memory media path: HWC RGB8 with caller-provided row stride in bytes
++   (0 => tightly packed width*3). The normal model preprocessing is applied. */
++float* da_capi_depth_rgb8(da_ctx* ctx, const unsigned char* rgb, int width, int height,
++                          size_t row_stride, int* out_h, int* out_w);
++/* Already-preprocessed host input: normalized planar F32 CHW [3,H,W]. This skips
++   image decode and resize/normalization and runs the fused depth-only graph. */
++float* da_capi_depth_chw_f32(da_ctx* ctx, const float* chw, int h, int w);
++/* Metadata attached to one asynchronous media-depth request. The Vulkan/media
++   wrapper should populate frame_id and pts_ns from the decoded source frame and
++   compose all decoder crop/rotation/aspect corrections into video_to_depth_uv.
++   Use da_capi_depth_request_init() before overriding fields. */
++typedef struct da_capi_depth_request {
++    size_t struct_size;
++    uint64_t frame_id;
++    int64_t pts_ns;
++    int output_element_type; /* DA_CAPI_DEPTH_ELEMENT_* */
++    float video_to_depth_uv[9];
++    float valid_depth_uv[4]; /* {min_u,min_v,max_u,max_v} */
++} da_capi_depth_request;
++void da_capi_depth_request_init(da_capi_depth_request* request);
++
++/* Description of the backend-resident depth tensor passed to the consumer.
++   The Vulkan bridge adds its own exported buffer/image and completion
++   semaphore/value around this result; this structure deliberately contains no
++   Vulkan handles and no stereo/RGB output. */
++typedef struct da_capi_device_depth_result {
++    size_t struct_size;
++    uint64_t frame_id;
++    int64_t pts_ns;
++    int width;
++    int height;
++    int element_type;         /* DA_CAPI_DEPTH_ELEMENT_* */
++    int depth_semantics;      /* DA_CAPI_DEPTH_SEMANTICS_* */
++    int depth_representation; /* DA_CAPI_DEPTH_REPRESENTATION_* */
++    float video_to_depth_uv[9];
++    float valid_depth_uv[4];
++    int has_intrinsics;
++    float intrinsics[9];
++} da_capi_device_depth_result;
++
++/* Advanced zero-host-readback hook for GPU media pipelines. input_tensor is a
++   backend-resident ggml_tensor* containing normalized F32 [W,H,3,1] data on the
++   same device selected for ctx. Inference is synchronous with respect to this
++   call (run it on the producer's inference worker), but all full-frame data stays
++   on the backend. The consumer receives the final depth tensor plus timestamped
++   side-stream metadata and must GPU-copy/consume the tensor before returning.
++   It must not retain backend/tensor pointers after the callback. */
++typedef int (*da_capi_device_depth_consumer_ex)(
++    void* user, void* backend, const void* depth_tensor,
++    const da_capi_device_depth_result* result);
++int da_capi_depth_device_tensor_ex(da_ctx* ctx, void* input_tensor, int h, int w,
++                                   const da_capi_depth_request* request,
++                                   da_capi_device_depth_consumer_ex consume, void* user);
++
++/* Compatibility form: F32 output, identity UV transform, no frame timestamp. */
++typedef int (*da_capi_device_depth_consumer)(void* user, void* backend, const void* depth_tensor);
++int da_capi_depth_device_tensor(da_ctx* ctx, void* input_tensor, int h, int w,
++                                da_capi_device_depth_consumer consume, void* user);
++
++/* Legacy geometry/normalization query retained for existing callers. New media
++   integrations should use da_capi_get_preprocess_desc() so the UV mapping is
++   explicit even when it is identity today. */
++int da_capi_preprocess_info(da_ctx* ctx, int src_w, int src_h,
++                            int* out_w, int* out_h, float mean3[3], float std3[3]);
+ void   da_capi_free_floats(float* p);
+ /* Run pose; fills ext[12] (3x4 row-major) and intr[9] (3x3). Returns 0 ok, -1 error. */
+ int da_capi_pose_path(da_ctx* ctx, const char* image_path, float out_ext[12], float out_intr[9]);
+diff --git a/src/backend.cpp b/src/backend.cpp
+index 801def1..ab1f948 100644
+--- a/src/backend.cpp
++++ b/src/backend.cpp
+@@ -1,5 +1,6 @@
+ #include "backend.hpp"
+ #include "common.hpp"
++#include "compute_mode.hpp"
+ 
+ #include "ggml.h"
+ #include "ggml-alloc.h"
+@@ -52,12 +53,28 @@ struct Backend::Impl {
+     std::vector<ggml_tensor*>   roots;
+ };
+ 
+-Backend::Backend() : impl_(new Impl()) {
+-    // Optional override via DA_DEVICE: "cpu" forces CPU; a device name selects
+-    // that registry device (case-insensitive); unset auto-picks a GPU/IGPU.
+-    const char* force = std::getenv("DA_DEVICE");
+-    const std::string want = force ? force : "";
+-    const bool force_cpu = want == "cpu" || want == "CPU";
++Backend::Backend(const BackendOptions& options) : impl_(new Impl()) {
++    // Preserve the existing environment-driven behaviour by default, but allow
++    // embedders (notably media players) to make device choice per-context.
++    std::string want;
++    bool force_cpu = false;
++    switch (options.device_policy) {
++        case DevicePolicy::Environment: {
++            const char* force = std::getenv("DA_DEVICE");
++            want = force ? force : "";
++            force_cpu = want == "cpu" || want == "CPU";
++            break;
++        }
++        case DevicePolicy::Auto:
++            break;
++        case DevicePolicy::Cpu:
++            want = "cpu";
++            force_cpu = true;
++            break;
++        case DevicePolicy::Named:
++            want = options.device_name;
++            break;
++    }
+ 
+     // Case-insensitive equality, used to match DA_DEVICE against the registry's
+     // device names (upper-case like "CUDA0"/"Vulkan0").
+@@ -94,9 +111,9 @@ Backend::Backend() : impl_(new Impl()) {
+         };
+ 
+         if (!want.empty()) {
+-            // Explicit DA_DEVICE: match by name (e.g. "Vulkan1", "CUDA0").
++            // Explicit device request: match by name (e.g. "Vulkan1", "CUDA0").
+             if (!try_pick([&](auto, const char* name) { return name && iequals(want, name); }))
+-                DA_LOG("da::Backend: DA_DEVICE=%s not found; falling back to CPU",
++                DA_LOG("da::Backend: device %s not found; falling back to CPU",
+                        want.c_str());
+         } else {
+             // Auto-pick: prefer a DISCRETE GPU over an integrated one. On multi-GPU
+@@ -210,8 +227,10 @@ void Backend::add_graph_root(ggml_tensor* t) {
+     impl_->roots.push_back(t);
+ }
+ 
+-bool Backend::compute(const std::function<ggml_tensor*(ggml_context*)>& build,
+-                      std::vector<float>& out, size_t graph_nodes) {
++bool Backend::compute_impl(const std::function<ggml_tensor*(ggml_context*)>& build,
++                           std::vector<float>* out,
++                           const std::function<bool(ggml_backend_t, const ggml_tensor*)>* consume,
++                           size_t graph_nodes) {
+     if (!impl_ || !impl_->backend) {
+         DA_LOG("Backend::compute called on an uninitialised backend");
+         return false;
+@@ -237,6 +256,10 @@ bool Backend::compute(const std::function<ggml_tensor*(ggml_context*)>& build,
+     impl_->pending.clear();
+     impl_->captures.clear();
+     impl_->roots.clear();
++    // Upstream graph builders choose a few CPU/GPU-specific ops through gpu_mode().
++    // Scope that decision to THIS backend invocation rather than model load, so a
++    // CPU context and a Vulkan/CUDA/Metal context can execute concurrently.
++    ScopedComputeMode compute_mode(offloading_);
+     struct ggml_tensor* output = build(ctx);
+     if (!output) {
+         DA_LOG("Backend::compute: build() returned null output tensor");
+@@ -397,12 +420,37 @@ bool Backend::compute(const std::function<ggml_tensor*(ggml_context*)>& build,
+     impl_->captures.clear();
+     impl_->roots.clear();
+ 
+-    size_t n = (size_t)ggml_nelements(output);
+-    out.resize(n);
+-    ggml_backend_tensor_get(output, out.data(), 0, n * sizeof(float));
++    bool consume_ok = true;
++    if (consume) {
++        ggml_backend_t output_backend = impl_->backend;
++        if (need_sched && impl_->sched) {
++            ggml_backend_t placed = ggml_backend_sched_get_tensor_backend(impl_->sched, output);
++            if (placed) output_backend = placed;
++        }
++        consume_ok = (*consume)(output_backend, output);
++    }
++
++    if (out) {
++        size_t n = (size_t)ggml_nelements(output);
++        out->resize(n);
++        ggml_backend_tensor_get(output, out->data(), 0, n * sizeof(float));
++    }
+ 
+     ggml_free(ctx);
+-    return true;
++    return consume_ok;
++}
++
++bool Backend::compute(const std::function<ggml_tensor*(ggml_context*)>& build,
++                      std::vector<float>& out, size_t graph_nodes) {
++    return compute_impl(build, &out, nullptr, graph_nodes);
++}
++
++bool Backend::compute_device(
++        const std::function<ggml_tensor*(ggml_context*)>& build,
++        const std::function<bool(ggml_backend_t, const ggml_tensor*)>& consume,
++        size_t graph_nodes) {
++    if (!consume) return false;
++    return compute_impl(build, nullptr, &consume, graph_nodes);
+ }
+ 
+ bool Backend::forward_capture(const std::function<ggml_tensor*(ggml_context*)>& build,
+diff --git a/src/backend.hpp b/src/backend.hpp
+index 7a4785f..1b413a3 100644
+--- a/src/backend.hpp
++++ b/src/backend.hpp
+@@ -10,6 +10,18 @@
+ 
+ namespace da {
+ 
++enum class DevicePolicy {
++    Environment, // legacy DA_DEVICE behaviour
++    Auto,        // ignore DA_DEVICE; GPU/IGPU then CPU
++    Cpu,         // force CPU
++    Named,       // exact registry device name (case-insensitive), else CPU
++};
++
++struct BackendOptions {
++    DevicePolicy device_policy = DevicePolicy::Environment;
++    std::string device_name;
++};
++
+ // Owns host buffers for graph inputs so they outlive a compute() call.
+ struct GraphInputPool {
+     std::vector<std::vector<float>> bufs;
+@@ -33,7 +45,7 @@ public:
+     //   - a device name   selects that registry device by name (case-insensitive,
+     //                     e.g. "CUDA0", "Vulkan0", "Metal").
+     //   - unset           auto-pick the first GPU/IGPU device, else CPU.
+-    Backend();
++    explicit Backend(const BackendOptions& options = {});
+     ~Backend();
+     Backend(const Backend&) = delete;
+     Backend& operator=(const Backend&) = delete;
+@@ -71,6 +83,13 @@ public:
+     // graph_nodes overrides the node budget for this call (0 => kDefaultGraphNodes).
+     bool compute(const std::function<ggml_tensor*(ggml_context*)>& build,
+                  std::vector<float>& out, size_t graph_nodes = 0);
++    // Execute the graph but keep the final tensor on its backend. `consume` runs
++    // synchronously after graph completion and before graph metadata/allocation can
++    // be recycled. It is intended for GPU->GPU bridge copies; it MUST NOT retain
++    // the ggml_tensor pointer after returning. No final tensor readback is done.
++    bool compute_device(const std::function<ggml_tensor*(ggml_context*)>& build,
++                        const std::function<bool(ggml_backend_t, const ggml_tensor*)>& consume,
++                        size_t graph_nodes = 0);
+     // Like compute but also reads back tensors registered via capture() during build.
+     bool forward_capture(const std::function<ggml_tensor*(ggml_context*)>& build,
+                          std::vector<float>& out, size_t graph_nodes = 0);
+@@ -89,6 +108,10 @@ private:
+     std::string device_name_ = "cpu";
+     bool        offloading_  = false;  // true iff `backend` is a non-CPU device
+     int         n_threads_   = 1;
++    bool compute_impl(const std::function<ggml_tensor*(ggml_context*)>& build,
++                      std::vector<float>* out,
++                      const std::function<bool(ggml_backend_t, const ggml_tensor*)>* consume,
++                      size_t graph_nodes);
+ };
+ 
+ }  // namespace da
+diff --git a/src/compute_mode.hpp b/src/compute_mode.hpp
+index 7362942..04c4ffc 100644
+--- a/src/compute_mode.hpp
++++ b/src/compute_mode.hpp
+@@ -1,12 +1,19 @@
+ #pragma once
+ 
+ namespace da {
+-// Global compute-mode flag, set by Engine::load once the backend's offload
+-// status is known. When true the graph builders route to STANDARD ggml ops
+-// that have CUDA kernels (direct conv2d, manual attention) instead of the
+-// CPU-tuned custom paths (Winograd custom-op, F32 flash-attn), which keeps the
+-// GPU graph free of forced GPU->CPU round-trips. Defaults to false, so the CPU
+-// path is byte-identical to before this flag existed.
++// The graph builder has a few CPU/GPU-specialized implementation choices.
++// Keep the mode thread-local and scope it to Backend::compute(), so independent
++// CPU and accelerator Engine instances can safely execute concurrently.
+ void set_gpu_mode(bool on);
+ bool gpu_mode();
++
++class ScopedComputeMode {
++public:
++    explicit ScopedComputeMode(bool gpu) : previous_(gpu_mode()) { set_gpu_mode(gpu); }
++    ~ScopedComputeMode() { set_gpu_mode(previous_); }
++    ScopedComputeMode(const ScopedComputeMode&) = delete;
++    ScopedComputeMode& operator=(const ScopedComputeMode&) = delete;
++private:
++    bool previous_;
++};
+ } // namespace da
+diff --git a/src/da_capi.cpp b/src/da_capi.cpp
+index d14123c..ee0eb5d 100644
+--- a/src/da_capi.cpp
++++ b/src/da_capi.cpp
+@@ -24,6 +24,8 @@
+ struct da_ctx {
+     std::unique_ptr<da::Engine> engine;
+     std::string last_error;
++    std::string device_name;
++    bool is_offloading = false;
+     // Per-frame capture poses from the most recent da_capi_points_stream call (OpenCV
+     // axes, 3F each). da_capi_points_stream is at the purego arg-count ceiling, so these
+     // are retrieved via da_capi_stream_last_poses instead of as out-params.
+@@ -73,6 +75,39 @@ static bool capi_is_metric(const da::Config& cfg){
+            n.find("mono")   != std::string::npos;
+ }
+ 
++static void capi_identity3(float m[9]){
++    if (!m) return;
++    const float ident[9] = {
++        1.f, 0.f, 0.f,
++        0.f, 1.f, 0.f,
++        0.f, 0.f, 1.f,
++    };
++    std::memcpy(m, ident, sizeof(ident));
++}
++
++static void capi_full_uv_rect(float r[4]){
++    if (!r) return;
++    r[0] = 0.f; r[1] = 0.f; r[2] = 1.f; r[3] = 1.f;
++}
++
++static bool capi_matrix_all_zero(const float m[9]){
++    if (!m) return true;
++    for (int i = 0; i < 9; ++i) if (m[i] != 0.f) return false;
++    return true;
++}
++
++static int capi_depth_semantics(const da::Engine& e){
++    if (e.is_nested() || capi_is_metric(e.config()))
++        return DA_CAPI_DEPTH_SEMANTICS_METRIC_METERS;
++    return DA_CAPI_DEPTH_SEMANTICS_RELATIVE;
++}
++
++static bool capi_camera_intrinsics_capable(const da::Engine& e){
++    // DA2 and standalone mono checkpoints expose depth only. DualDPT/nested
++    // variants have a camera path in the full image pipeline.
++    return e.is_nested() || (!e.is_da2() && !e.is_mono());
++}
++
+ // Run the nested metric pipeline (anyview GIANT + metric ViT-L branches ->
+ // alignment) for a single image. Fills depth + scaled ext/intr + processed dims.
+ // Returns false with c->last_error set on failure.
+@@ -89,8 +124,92 @@ static bool capi_run_nested(da_ctx* c, const char* image_path,
+     return true;
+ }
+ 
++static da_capi_load_options capi_default_load_options(int n_threads){
++    da_capi_load_options o{};
++    o.struct_size = sizeof(o);
++    o.n_threads = n_threads;
++    o.device_policy = DA_CAPI_DEVICE_DEFAULT;
++    o.device_name = nullptr;
++    return o;
++}
++
++static bool capi_engine_load_options(const da_capi_load_options* in, da::EngineLoadOptions& out){
++    const da_capi_load_options def = capi_default_load_options(1);
++    const da_capi_load_options* o = in ? in : &def;
++    if (o->struct_size < sizeof(da_capi_load_options)) return false;
++    out.n_threads = o->n_threads;
++    switch (o->device_policy) {
++        case DA_CAPI_DEVICE_DEFAULT:
++            out.backend.device_policy = da::DevicePolicy::Environment;
++            break;
++        case DA_CAPI_DEVICE_AUTO:
++            out.backend.device_policy = da::DevicePolicy::Auto;
++            break;
++        case DA_CAPI_DEVICE_CPU:
++            out.backend.device_policy = da::DevicePolicy::Cpu;
++            break;
++        case DA_CAPI_DEVICE_NAMED:
++            if (!o->device_name || !*o->device_name) return false;
++            out.backend.device_policy = da::DevicePolicy::Named;
++            out.backend.device_name = o->device_name;
++            break;
++        default:
++            return false;
++    }
++    return true;
++}
++
++static da_ctx* capi_wrap_engine(std::unique_ptr<da::Engine> e){
++    if (!e) return nullptr;
++    auto* c = new da_ctx();
++    c->device_name = e->device_name();
++    c->is_offloading = e->is_offloading();
++    c->engine = std::move(e);
++    return c;
++}
++
+ extern "C" {
+-int da_capi_abi_version(void){ return 11; }
++int da_capi_abi_version(void){ return 13; }
++
++void da_capi_load_options_init(da_capi_load_options* options){
++    if (options) *options = capi_default_load_options(1);
++}
++
++void da_capi_depth_model_info_init(da_capi_depth_model_info* info){
++    if (!info) return;
++    std::memset(info, 0, sizeof(*info));
++    info->struct_size = sizeof(*info);
++    info->depth_semantics = DA_CAPI_DEPTH_SEMANTICS_UNKNOWN;
++    info->depth_representation = DA_CAPI_DEPTH_REPRESENTATION_UNKNOWN;
++}
++
++int da_capi_get_depth_model_info(da_ctx* c, da_capi_depth_model_info* info){
++    if (!c || !c->engine || !info || info->struct_size < sizeof(*info)){
++        if (c) c->last_error = "depth_model_info: bad args";
++        return -1;
++    }
++    info->depth_semantics = capi_depth_semantics(*c->engine);
++    info->depth_representation = DA_CAPI_DEPTH_REPRESENTATION_Z;
++    info->camera_intrinsics_capable = capi_camera_intrinsics_capable(*c->engine) ? 1 : 0;
++    return 0;
++}
++
++void da_capi_preprocess_desc_init(da_capi_preprocess_desc* desc){
++    if (!desc) return;
++    std::memset(desc, 0, sizeof(*desc));
++    desc->struct_size = sizeof(*desc);
++    capi_identity3(desc->source_to_depth_uv);
++    capi_full_uv_rect(desc->valid_depth_uv);
++}
++
++void da_capi_depth_request_init(da_capi_depth_request* request){
++    if (!request) return;
++    std::memset(request, 0, sizeof(*request));
++    request->struct_size = sizeof(*request);
++    request->output_element_type = DA_CAPI_DEPTH_ELEMENT_F16;
++    capi_identity3(request->video_to_depth_uv);
++    capi_full_uv_rect(request->valid_depth_uv);
++}
+ 
+ // Scene-relative TSDF fusion knobs applied by the NEXT da_capi_points_stream when
+ // its fuse flag is set. voxel_frac = voxel edge as a fraction of the bbox diagonal
+@@ -107,16 +226,34 @@ void da_capi_set_temporal_voxel_mesh(da_ctx* c, int enabled){
+     c->temporal_voxel_mesh_enabled = (enabled != 0);
+ }
+ da_ctx* da_capi_load(const char* path, int n_threads){
++    da_capi_load_options options = capi_default_load_options(n_threads);
++    return da_capi_load_ex(path, &options);
++}
++
++da_ctx* da_capi_load_ex(const char* path, const da_capi_load_options* options){
+     if (!path) return nullptr;
+-    auto e = da::Engine::load(path, n_threads);
+-    if (!e) return nullptr;
+-    auto* c = new da_ctx(); c->engine = std::move(e); return c;
++    da::EngineLoadOptions eo;
++    if (!capi_engine_load_options(options, eo)) return nullptr;
++    return capi_wrap_engine(da::Engine::load(path, eo));
+ }
++
+ da_ctx* da_capi_load_nested(const char* anyview, const char* metric, int n_threads){
++    da_capi_load_options options = capi_default_load_options(n_threads);
++    return da_capi_load_nested_ex(anyview, metric, &options);
++}
++
++da_ctx* da_capi_load_nested_ex(const char* anyview, const char* metric,
++                                const da_capi_load_options* options){
+     if (!anyview || !metric) return nullptr;
+-    auto e = da::Engine::load_nested(anyview, metric, n_threads);
+-    if (!e) return nullptr;
+-    auto* c = new da_ctx(); c->engine = std::move(e); return c;
++    da::EngineLoadOptions eo;
++    if (!capi_engine_load_options(options, eo)) return nullptr;
++    return capi_wrap_engine(da::Engine::load_nested(anyview, metric, eo));
++}
++
++const char* da_capi_device_name(const da_ctx* c){ return c ? c->device_name.c_str() : ""; }
++int da_capi_is_offloading(const da_ctx* c){ return c && c->is_offloading ? 1 : 0; }
++void* da_capi_backend_handle(da_ctx* c){
++    return (c && c->engine) ? static_cast<void*>(c->engine->backend_handle()) : nullptr;
+ }
+ void da_capi_free(da_ctx* c){ delete c; }
+ char* da_capi_info_json(da_ctx* c){
+@@ -145,6 +282,214 @@ float* da_capi_depth_path(da_ctx* c, const char* image_path, int* out_h, int* ou
+     if (out_w) *out_w = W;
+     return p;
+ }
++
++
++float* da_capi_depth_rgb8(da_ctx* c, const unsigned char* rgb, int width, int height,
++                          size_t row_stride, int* out_h, int* out_w){
++    if (!c || !c->engine || !rgb || width <= 0 || height <= 0){
++        if (c) c->last_error = "depth_rgb8: bad args";
++        return nullptr;
++    }
++    const size_t tight = (size_t)width * 3;
++    if (row_stride == 0) row_stride = tight;
++    if (row_stride < tight){ c->last_error = "depth_rgb8: row_stride too small"; return nullptr; }
++
++    da::Image img; img.w = width; img.h = height; img.rgb.resize(tight * (size_t)height);
++    for (int y = 0; y < height; ++y)
++        std::memcpy(img.rgb.data() + (size_t)y * tight, rgb + (size_t)y * row_stride, tight);
++
++    std::vector<float> depth; int H = 0, W = 0;
++    bool ok = false;
++    if (c->engine->is_nested()) {
++        da::NestedOut out;
++        ok = c->engine->depth_metric(img, out, H, W);
++        if (ok) depth = std::move(out.depth);
++    } else {
++        // Media path is depth-only: preprocess once, then use the same fused
++        // backbone+DPT graph used by the GPU-resident entry point for DA2/DA3.
++        da::Preprocessed p;
++        ok = da::preprocess_real(img, c->engine->config(), p);
++        if (ok) {
++            H = p.H; W = p.W;
++            ok = c->engine->depth_preprocessed(p.chw.data(), H, W, depth);
++        }
++        // Host path may safely fall back to the existing implementations if a
++        // backend cannot run the fused graph. The device-tensor path never does
++        // this because that would imply a full readback.
++        if (!ok) {
++            std::vector<float> aux;
++            if (c->engine->is_da2())
++                ok = c->engine->depth_relative(img, depth, H, W);
++            else if (c->engine->is_mono())
++                ok = c->engine->depth_mono(img, depth, aux, H, W);
++            else
++                ok = c->engine->depth_native_image(img, depth, aux, H, W);
++        }
++    }
++    if (!ok){ c->last_error = "depth_rgb8: inference failed"; return nullptr; }
++
++    float* out = (float*)std::malloc(depth.size() * sizeof(float));
++    if (!out){ c->last_error = "depth_rgb8: oom"; return nullptr; }
++    std::memcpy(out, depth.data(), depth.size() * sizeof(float));
++    if (out_h) *out_h = H;
++    if (out_w) *out_w = W;
++    return out;
++}
++
++float* da_capi_depth_chw_f32(da_ctx* c, const float* chw, int h, int w){
++    if (!c || !c->engine || !chw || h <= 0 || w <= 0){
++        if (c) c->last_error = "depth_chw_f32: bad args";
++        return nullptr;
++    }
++    std::vector<float> depth;
++    if (!c->engine->depth_preprocessed(chw, h, w, depth)){
++        c->last_error = "depth_chw_f32: inference failed";
++        return nullptr;
++    }
++    float* out = (float*)std::malloc(depth.size() * sizeof(float));
++    if (!out){ c->last_error = "depth_chw_f32: oom"; return nullptr; }
++    std::memcpy(out, depth.data(), depth.size() * sizeof(float));
++    return out;
++}
++
++int da_capi_depth_device_tensor_ex(da_ctx* c, void* input_tensor, int h, int w,
++                                   const da_capi_depth_request* request,
++                                   da_capi_device_depth_consumer_ex consume, void* user){
++    if (!c || !c->engine || !input_tensor || !consume || h <= 0 || w <= 0){
++        if (c) c->last_error = "depth_device_tensor_ex: bad args";
++        return -1;
++    }
++    if (!c->engine->is_offloading()){
++        c->last_error = "depth_device_tensor_ex: context is not using an accelerator backend";
++        return -1;
++    }
++
++    da_capi_depth_request req{};
++    da_capi_depth_request_init(&req);
++    if (request) {
++        if (request->struct_size < sizeof(*request)){
++            c->last_error = "depth_device_tensor_ex: request struct too small";
++            return -1;
++        }
++        req = *request;
++        if (capi_matrix_all_zero(req.video_to_depth_uv))
++            capi_identity3(req.video_to_depth_uv);
++    }
++
++    ggml_type output_type = GGML_TYPE_F32;
++    if (req.output_element_type == DA_CAPI_DEPTH_ELEMENT_F16)
++        output_type = GGML_TYPE_F16;
++    else if (req.output_element_type != DA_CAPI_DEPTH_ELEMENT_F32) {
++        c->last_error = "depth_device_tensor_ex: unsupported output element type";
++        return -1;
++    }
++
++    da_capi_device_depth_result result{};
++    result.struct_size = sizeof(result);
++    result.frame_id = req.frame_id;
++    result.pts_ns = req.pts_ns;
++    result.width = w;
++    result.height = h;
++    result.element_type = req.output_element_type;
++    result.depth_semantics = capi_depth_semantics(*c->engine);
++    result.depth_representation = DA_CAPI_DEPTH_REPRESENTATION_Z;
++    std::memcpy(result.video_to_depth_uv, req.video_to_depth_uv,
++                sizeof(result.video_to_depth_uv));
++    std::memcpy(result.valid_depth_uv, req.valid_depth_uv,
++                sizeof(result.valid_depth_uv));
++    result.has_intrinsics = 0;
++    std::memset(result.intrinsics, 0, sizeof(result.intrinsics));
++
++    auto* input = static_cast<ggml_tensor*>(input_tensor);
++    bool ok = c->engine->depth_preprocessed_device(input, h, w, output_type,
++        [&](ggml_backend_t backend, const ggml_tensor* depth) -> bool {
++            // The media/device API promises a genuinely accelerator-resident result.
++            // If ggml had to place the final op on its CPU fallback backend, fail
++            // rather than silently introducing the full depth readback that this API
++            // exists to avoid.
++            if (backend != c->engine->backend_handle()) return false;
++            return consume(user, static_cast<void*>(backend),
++                           static_cast<const void*>(depth), &result) == 0;
++        });
++    if (!ok){
++        c->last_error = "depth_device_tensor_ex: inference/consumer failed";
++        return -1;
++    }
++    return 0;
++}
++
++struct capi_compat_device_consumer {
++    da_capi_device_depth_consumer fn = nullptr;
++    void* user = nullptr;
++};
++
++static int capi_compat_device_consume(void* opaque, void* backend,
++                                      const void* depth_tensor,
++                                      const da_capi_device_depth_result*){
++    auto* c = static_cast<capi_compat_device_consumer*>(opaque);
++    return c->fn(c->user, backend, depth_tensor);
++}
++
++int da_capi_depth_device_tensor(da_ctx* c, void* input_tensor, int h, int w,
++                                da_capi_device_depth_consumer consume, void* user){
++    if (!consume){
++        if (c) c->last_error = "depth_device_tensor: bad consumer";
++        return -1;
++    }
++    da_capi_depth_request req{};
++    da_capi_depth_request_init(&req);
++    req.output_element_type = DA_CAPI_DEPTH_ELEMENT_F32;
++    capi_compat_device_consumer compat{consume, user};
++    return da_capi_depth_device_tensor_ex(c, input_tensor, h, w, &req,
++                                          capi_compat_device_consume, &compat);
++}
++
++int da_capi_get_preprocess_desc(da_ctx* c, int src_w, int src_h,
++                                da_capi_preprocess_desc* desc){
++    if (!c || !c->engine || !desc || desc->struct_size < sizeof(*desc) ||
++        src_w <= 0 || src_h <= 0){
++        if (c) c->last_error = "preprocess_desc: bad args";
++        return -1;
++    }
++    const auto& cfg = c->engine->config();
++    int w = 0, h = 0;
++    if (!da::preprocess_real_size(src_w, src_h, cfg, w, h)){
++        c->last_error = "preprocess_desc: invalid model preprocess config";
++        return -1;
++    }
++    if (cfg.img_mean.size() < 3 || cfg.img_std.size() < 3){
++        c->last_error = "preprocess_desc: missing normalization constants";
++        return -1;
++    }
++
++    desc->output_width = w;
++    desc->output_height = h;
++    for (int i = 0; i < 3; ++i) {
++        desc->mean[i] = cfg.img_mean[i];
++        desc->std[i] = cfg.img_std[i];
++    }
++
++    // preprocess_real() currently resizes the complete source image twice without
++    // crop, pad, rotate or mirror. In normalized continuous UV coordinates the
++    // source and final depth therefore share the same domain. Keep this explicit
++    // so a future preprocessing-policy change must update this contract.
++    capi_identity3(desc->source_to_depth_uv);
++    capi_full_uv_rect(desc->valid_depth_uv);
++    return 0;
++}
++
++int da_capi_preprocess_info(da_ctx* c, int src_w, int src_h,
++                            int* out_w, int* out_h, float mean3[3], float std3[3]){
++    da_capi_preprocess_desc desc{};
++    da_capi_preprocess_desc_init(&desc);
++    if (da_capi_get_preprocess_desc(c, src_w, src_h, &desc) != 0)
++        return -1;
++    if (out_w) *out_w = desc.output_width;
++    if (out_h) *out_h = desc.output_height;
++    if (mean3) std::memcpy(mean3, desc.mean, sizeof(desc.mean));
++    if (std3)  std::memcpy(std3,  desc.std,  sizeof(desc.std));
++    return 0;
++}
+ void da_capi_free_floats(float* p){ std::free(p); }
+ int da_capi_pose_path(da_ctx* c, const char* image_path, float out_ext[12], float out_intr[9]){
+     if (!c || !c->engine || !image_path){ if (c) c->last_error = "pose: bad args"; return -1; }
+diff --git a/src/dino_backbone.cpp b/src/dino_backbone.cpp
+index e991194..3d5084f 100644
+--- a/src/dino_backbone.cpp
++++ b/src/dino_backbone.cpp
+@@ -215,8 +215,16 @@ bool DinoBackbone::forward(const std::vector<float>& input_chw, int H, int W,
+ 
+ bool DinoBackbone::build_feats_graph(ggml_context* ctx, const std::vector<float>& input_chw,
+                                      int H, int W, GraphInputPool& pool, ggml_tensor* out_feat[4]){
++    const int64_t ine[4] = { W, H, 3, 1 };
++    ggml_tensor* img = be_.add_graph_input_nd(ctx, pool, input_chw.data(), ine, 4);
++    return build_feats_graph(ctx, img, H, W, pool, out_feat);
++}
++
++bool DinoBackbone::build_feats_graph(ggml_context* ctx, ggml_tensor* input_chw,
++                                     int H, int W, GraphInputPool& pool, ggml_tensor* out_feat[4]){
+     const auto& c = ml_.config();
+-    if (!c.cat_token) return false;   // fused path is the cat_token=true (BASE/giant) case only
++    if (!input_chw || input_chw->ne[0] != W || input_chw->ne[1] != H ||
++        input_chw->ne[2] != 3) return false;
+     const int patch=(int)c.patch_size, gh=H/patch, gw=W/patch;
+     const int embed=(int)c.embed_dim, heads=(int)c.num_heads, hd=(int)c.head_dim;
+     const int Npatch=gh*gw, Ntok=1+Npatch;
+@@ -253,9 +261,8 @@ bool DinoBackbone::build_feats_graph(ggml_context* ctx, const std::vector<float>
+     }
+ 
+     // --- prepare tokens (same graph as forward()) ---
+-    const int64_t ine[4]={W,H,3,1};
+-    ggml_tensor* img = be_.add_graph_input_nd(ctx, pool, input_chw.data(), ine, 4);
+-    ggml_tensor* x = ggml_conv_2d(ctx, ml_.tensor("vit.patch_embed.weight"), img, patch,patch,0,0,1,1);
++    ggml_tensor* x = ggml_conv_2d(ctx, ml_.tensor("vit.patch_embed.weight"), input_chw,
++                                  patch,patch,0,0,1,1);
+     x = ggml_reshape_2d(ctx, x, (int64_t)Npatch, embed);
+     x = ggml_cont(ctx, ggml_transpose(ctx, x));
+     x = ggml_add(ctx, x, ml_.tensor("vit.patch_embed.bias"));
+@@ -290,14 +297,20 @@ bool DinoBackbone::build_feats_graph(ggml_context* ctx, const std::vector<float>
+         x = vit_block(ctx, x, bw, heads, hd, eps, cb, sb);
+         if (!global) local_x = x;
+         for (size_t o=0;o<NL && o<4;++o) if (outL[o]==i){
+-            // feat = cat([local_x_raw, layernorm(x)], dim0), then strip token-0.
+-            // Layout matches forward()'s host post-process exactly: channel 0..embed-1
+-            // = local_x RAW, embed..2*embed-1 = vit.norm(x); token-major channel-minor.
+             ggml_tensor* normed = layernorm(ctx, x, nw, nb, eps);
+-            ggml_tensor* fcat   = ggml_concat(ctx, local_x, normed, 0);   // [2*embed, Ntok]
+-            ggml_tensor* fstr   = ggml_cont(ctx, ggml_view_2d(ctx, fcat, 2*(int64_t)embed,
+-                                                Npatch, fcat->nb[1], fcat->nb[1]));
+-            out_feat[o] = fstr;                                            // [2*embed, Npatch]
++            if (c.cat_token) {
++                // DA3 any-view: feat = cat([local_x_raw, layernorm(x)], dim0),
++                // then strip token-0. Layout matches forward()'s host post-process.
++                ggml_tensor* fcat = ggml_concat(ctx, local_x, normed, 0); // [2E,Ntok]
++                out_feat[o] = ggml_cont(ctx, ggml_view_2d(ctx, fcat,
++                    2*(int64_t)embed, Npatch, fcat->nb[1], fcat->nb[1])); // [2E,Npatch]
++            } else {
++                // DA2 and DA3 mono/metric: get_intermediate_layers returns only
++                // vit.norm(x), with cls token removed. Keeping this in the same
++                // graph avoids the old GPU->CPU feature readback + CPU->GPU upload.
++                out_feat[o] = ggml_cont(ctx, ggml_view_2d(ctx, normed,
++                    (int64_t)embed, Npatch, normed->nb[1], normed->nb[1])); // [E,Npatch]
++            }
+         }
+     }
+     return true;
+diff --git a/src/dino_backbone.hpp b/src/dino_backbone.hpp
+index ebb26b9..3e0fb7e 100644
+--- a/src/dino_backbone.hpp
++++ b/src/dino_backbone.hpp
+@@ -26,16 +26,17 @@ public:
+                     std::vector<std::vector<std::vector<float>>>& feats,
+                     std::vector<std::vector<std::vector<float>>>& cam_tokens,
+                     int* out_b_idx = nullptr);
+-    // Fused single-image path: build the SAME block loop as forward() but, at each
+-    // out-layer, produce the feat tensor IN-GRAPH instead of capturing to host:
+-    //   feat = ggml_concat([ local_x, layernorm(x, vit.norm.{w,b}, ln_eps) ], dim0)
+-    //          with token-0 stripped -> [2*embed, Npatch] (ne0=channel, ne1=token).
+-    // This matches forward()'s host post-process (cat[local_x_raw, norm(x)]) so the
+-    // features never leave the device. out_feat[o] for o in [0, out_layers.size()).
+-    // Restricted to cat_token=true (BASE/giant); returns false otherwise. Built into
+-    // the caller's compute() ctx/pool (engine fuses this with the DPT head graph).
++    // Fused single-image path: produce all four intermediate feature tensors in
++    // the caller's graph instead of capturing them to host. Supports both DA3's
++    // cat([local_x,norm(x)]) features and DA2/mono/metric norm(x)-only features.
+     bool build_feats_graph(ggml_context* ctx, const std::vector<float>& input_chw,
+                            int H, int W, GraphInputPool& pool, ggml_tensor* out_feat[4]);
++    // Same graph, but consume an already backend-resident normalized CHW tensor
++    // [W,H,3,1]. This is the zero-host-copy hook used by Vulkan/media integrations.
++    // The tensor may come from a different ggml_context as long as its metadata and
++    // backend buffer stay alive through graph execution (weights work the same way).
++    bool build_feats_graph(ggml_context* ctx, ggml_tensor* input_chw,
++                           int H, int W, GraphInputPool& pool, ggml_tensor* out_feat[4]);
+ private:
+     std::vector<float> interp_pos_embed(int gh, int gw) const;  // host bicubic -> [(1+gh*gw)*embed], token-major embed-minor
+     // Full multi-view forward on views already in processing order (ref first when
+diff --git a/src/engine.cpp b/src/engine.cpp
+index d173fc0..fd9c64b 100644
+--- a/src/engine.cpp
++++ b/src/engine.cpp
+@@ -13,26 +13,39 @@
+ #include "gs_head.hpp"
+ #include "gs_adapter.hpp"
+ #include "nested.hpp"
+-#include "compute_mode.hpp"
+ 
+ namespace da {
+ std::unique_ptr<Engine> Engine::load(const std::string& path, int n_threads){
+-    std::unique_ptr<Engine> e(new Engine());
++    EngineLoadOptions options;
++    options.n_threads = n_threads;
++    return load(path, options);
++}
++
++std::unique_ptr<Engine> Engine::load(const std::string& path,
++                                     const EngineLoadOptions& options){
++    std::unique_ptr<Engine> e(new Engine(options.backend));
+     if (!e->ml_.load(path)) { DA_LOG("engine: load failed"); return nullptr; }
+-    e->be_.set_n_threads(n_threads > 0 ? n_threads : 1);
++    e->be_.set_n_threads(options.n_threads > 0 ? options.n_threads : 1);
+     if (!e->ml_.offload_weights(e->be_)) { DA_LOG("engine: offload failed"); return nullptr; }
+-    // Route graph builders to GPU-friendly standard ops iff weights are device-resident.
+-    da::set_gpu_mode(e->be_.is_offloading());
+     return e;
+ }
++
+ std::unique_ptr<Engine> Engine::load_nested(const std::string& anyview_gguf,
+                                             const std::string& metric_gguf, int n_threads){
+-    auto e = load(anyview_gguf, n_threads);
++    EngineLoadOptions options;
++    options.n_threads = n_threads;
++    return load_nested(anyview_gguf, metric_gguf, options);
++}
++
++std::unique_ptr<Engine> Engine::load_nested(const std::string& anyview_gguf,
++                                            const std::string& metric_gguf,
++                                            const EngineLoadOptions& options){
++    auto e = load(anyview_gguf, options);
+     if (!e) { DA_LOG("engine: anyview load failed"); return nullptr; }
+     e->metric_ml_.reset(new ModelLoader());
+-    e->metric_be_.reset(new Backend());
++    e->metric_be_.reset(new Backend(options.backend));
+     if (!e->metric_ml_->load(metric_gguf)) { DA_LOG("engine: metric load failed"); return nullptr; }
+-    e->metric_be_->set_n_threads(n_threads > 0 ? n_threads : 1);
++    e->metric_be_->set_n_threads(options.n_threads > 0 ? options.n_threads : 1);
+     if (!e->metric_ml_->offload_weights(*e->metric_be_)) { DA_LOG("engine: metric offload failed"); return nullptr; }
+     return e;
+ }
+@@ -83,6 +96,13 @@ bool Engine::depth_relative(const Image& img, std::vector<float>& depth_out, int
+     Preprocessed p;
+     if (!preprocess_real(img, ml_.config(), p)) { DA_LOG("depth_relative: preprocess_real failed"); return false; }
+     H = p.H; W = p.W;
++
++    // Prefer the one-graph media path, but keep the old two-graph implementation
++    // as an A/B escape hatch and backend-compatibility fallback.
++    const char* fenv = std::getenv("DA_FUSED");
++    const bool fused_off = fenv && std::string(fenv) == "0";
++    if (!fused_off && depth_preprocessed(p.chw.data(), H, W, depth_out)) return true;
++
+     DinoBackbone bb(ml_, be_);
+     std::vector<std::vector<float>> feats, cam_tokens;
+     if (!bb.forward(p.chw, H, W, feats, cam_tokens)) { DA_LOG("depth_relative: backbone failed"); return false; }
+@@ -94,6 +114,78 @@ bool Engine::depth_relative_path(const std::string& image_path, std::vector<floa
+     Image img; if (!load_image_rgb(image_path, img)) { DA_LOG("depth_relative: load image failed"); return false; }
+     return depth_relative(img, depth_out, H, W);
+ }
++
++
++ggml_tensor* Engine::build_depth_only_graph(ggml_context* ctx, ggml_tensor* input_chw,
++                                            int H, int W, GraphInputPool& pool,
++                                            ggml_type output_type){
++    if (!input_chw || H <= 0 || W <= 0) return nullptr;
++    const int patch = (int)ml_.config().patch_size;
++    if (patch <= 0 || (H % patch) != 0 || (W % patch) != 0) return nullptr;
++
++    DinoBackbone bb(ml_, be_);
++    DptHead head(ml_, be_);
++    ggml_tensor* feat[4] = { nullptr, nullptr, nullptr, nullptr };
++    if (!bb.build_feats_graph(ctx, input_chw, H, W, pool, feat)) return nullptr;
++    ggml_tensor* logits = head.build_depth_graph(ctx, feat, H, W, pool,
++                                                 nullptr, nullptr, nullptr);
++    if (!logits) return nullptr;
++
++    // DPT logits are [W,H,C,1]. Keep depth channel 0 and perform the final
++    // model-specific activation in-graph so the device callback receives actual
++    // depth, not logits.
++    ggml_tensor* depth = ggml_view_2d(ctx, logits, W, H, logits->nb[1], 0);
++    depth = ggml_cont(ctx, depth);
++    if (is_da2()) {
++        if (ml_.config().head_max_depth > 0.f)
++            depth = ggml_scale(ctx, ggml_sigmoid(ctx, depth), ml_.config().head_max_depth);
++        else
++            depth = ggml_relu(ctx, depth);
++    } else {
++        depth = ggml_exp(ctx, depth);
++    }
++    if (output_type != GGML_TYPE_F32) {
++        if (output_type != GGML_TYPE_F16) return nullptr;
++        depth = ggml_cast(ctx, depth, output_type);
++    }
++    return depth;
++}
++
++bool Engine::depth_preprocessed(const float* chw, int H, int W,
++                                std::vector<float>& depth_out){
++    if (!chw || is_nested()) return false;
++    GraphInputPool pool;
++    return be_.compute([&](ggml_context* ctx) -> ggml_tensor* {
++        const int64_t ne[4] = { W, H, 3, 1 };
++        ggml_tensor* input = be_.add_graph_input_nd(ctx, pool, chw, ne, 4);
++        return build_depth_only_graph(ctx, input, H, W, pool);
++    }, depth_out);
++}
++
++bool Engine::depth_preprocessed_device(
++        ggml_tensor* input_chw, int H, int W, ggml_type output_type,
++        const std::function<bool(ggml_backend_t, const ggml_tensor*)>& consume){
++    if (!input_chw || !consume || is_nested() || !be_.is_offloading()) return false;
++    if (output_type != GGML_TYPE_F32 && output_type != GGML_TYPE_F16) return false;
++    if (input_chw->type != GGML_TYPE_F32 || input_chw->ne[0] != W ||
++        input_chw->ne[1] != H || input_chw->ne[2] != 3 || input_chw->ne[3] != 1)
++        return false;
++
++    // The input may be persistent metadata from another ggml_context, but its
++    // storage must belong to the same backend device as this Engine. This catches
++    // accidental cross-device pointers before the graph allocator reaches them.
++    ggml_backend_buffer_t buf = input_chw->view_src ? input_chw->view_src->buffer
++                                                     : input_chw->buffer;
++    if (!buf) return false;
++    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buf);
++    if (!buft || ggml_backend_buft_get_device(buft) != ggml_backend_get_device(be_.handle()))
++        return false;
++
++    GraphInputPool pool;
++    return be_.compute_device([&](ggml_context* ctx) -> ggml_tensor* {
++        return build_depth_only_graph(ctx, input_chw, H, W, pool, output_type);
++    }, consume);
++}
+ bool Engine::depth_native(const std::string& image_path, std::vector<float>& depth_out,
+                           std::vector<float>& conf_out, int& H, int& W){
+     Image img; if (!load_image_rgb(image_path, img)) { DA_LOG("depth_native: load image failed"); return false; }
+diff --git a/src/engine.hpp b/src/engine.hpp
+index 19e32a0..5fcf2e4 100644
+--- a/src/engine.hpp
++++ b/src/engine.hpp
+@@ -8,8 +8,15 @@
+ #include <string>
+ #include <vector>
+ #include <array>
++#include <functional>
+ 
+ namespace da {
++
++struct EngineLoadOptions {
++    int n_threads = 1;
++    BackendOptions backend;
++};
++
+ enum class TaskMode { DEPTH, DEPTH_POSE, MULTIVIEW, RECONSTRUCT, NESTED_METRIC };
+ 
+ // Per-view result of the multi-view pipeline.
+@@ -22,11 +29,19 @@ struct ViewResult {
+ class Engine {
+ public:
+     static std::unique_ptr<Engine> load(const std::string& gguf_path, int n_threads);
++    static std::unique_ptr<Engine> load(const std::string& gguf_path,
++                                        const EngineLoadOptions& options);
+     // Nested metric: loads BOTH the anyview (GIANT) GGUF and the metric (ViT-L
+     // + DPT/sky) GGUF. depth_metric() then runs both branches + alignment.
+     static std::unique_ptr<Engine> load_nested(const std::string& anyview_gguf,
+                                                const std::string& metric_gguf, int n_threads);
++    static std::unique_ptr<Engine> load_nested(const std::string& anyview_gguf,
++                                               const std::string& metric_gguf,
++                                               const EngineLoadOptions& options);
+     const Config& config() const { return ml_.config(); }
++    const std::string& device_name() const { return be_.device_name(); }
++    bool is_offloading() const { return be_.is_offloading(); }
++    ggml_backend_t backend_handle() const { return be_.handle(); }
+     // True iff this engine was created via load_nested() (anyview + metric
+     // branches both loaded). depth_metric() is then the valid inference path.
+     bool is_nested() const { return metric_ml_ != nullptr; }
+@@ -44,6 +59,17 @@ public:
+     bool depth_relative(const Image& img, std::vector<float>& depth_out, int& H, int& W);
+     bool depth_relative_path(const std::string& image_path, std::vector<float>& depth_out,
+                              int& H, int& W);
++    // Depth-only fast path for media integration. The input is already resized
++    // and normalized CHW F32 at model resolution, so no image decode/CPU resize is
++    // performed. Backbone + DPT + final depth activation run as ONE ggml graph for
++    // both DA2 and DA3 single-image models.
++    bool depth_preprocessed(const float* chw, int H, int W, std::vector<float>& depth_out);
++    // Same graph with an already backend-resident [W,H,3,1] F32 tensor. The callback
++    // runs after compute while the output depth tensor [W,H] is still resident. It
++    // must copy/consume it synchronously and must not retain the ggml_tensor pointer.
++    bool depth_preprocessed_device(
++        ggml_tensor* input_chw, int H, int W, ggml_type output_type,
++        const std::function<bool(ggml_backend_t, const ggml_tensor*)>& consume);
+     // M1: debug entry returning backbone features for out_layers (filled in T16).
+     bool backbone_features(const std::vector<float>& input_image, int H, int W,
+                            std::vector<std::vector<float>>& feats_out);
+@@ -115,10 +141,15 @@ public:
+     bool metric_branch(const Image& img, std::vector<float>& depth_raw,
+                        std::vector<float>& sky, int& H, int& W);
+ private:
++    explicit Engine(const BackendOptions& backend_options) : be_(backend_options) {}
++    ggml_tensor* build_depth_only_graph(ggml_context* ctx, ggml_tensor* input_chw,
++                                        int H, int W, GraphInputPool& pool,
++                                        ggml_type output_type = GGML_TYPE_F32);
+     // Fused single-image depth: backbone feats + DPT head built into ONE ggml graph
+     // (feats stay device-resident — no GPU->host->GPU round-trip). Parity-exact with
+-    // the unfused path. cat_token=true only; depth_native_image falls back to unfused
+-    // otherwise or when DA_FUSED=0. The unfused variant keeps the original two-graph
++    // the unfused path. The media depth-only path supports both cat_token=true
++    // and cat_token=false; depth_native_image keeps its existing DA_FUSED A/B policy.
++    // The unfused variant keeps the original two-graph
+     // path (used by ctest's separate backbone/head gates, A/B, and as fallback).
+     bool depth_native_fused(const Image& img, std::vector<float>& depth_out,
+                             std::vector<float>& conf_out, int& H, int& W);
+diff --git a/src/model_loader.cpp b/src/model_loader.cpp
+index 41d7be3..a14577c 100644
+--- a/src/model_loader.cpp
++++ b/src/model_loader.cpp
+@@ -10,8 +10,8 @@
+ 
+ namespace da {
+ 
+-// --- Global GPU compute-mode flag (see compute_mode.hpp) -------------------
+-static bool g_gpu_mode = false;
++// --- Thread-local graph-build compute mode (see compute_mode.hpp) -----------
++static thread_local bool g_gpu_mode = false;
+ void set_gpu_mode(bool on){ g_gpu_mode = on; }
+ bool gpu_mode(){ return g_gpu_mode; }
+ 
+diff --git a/src/preprocess.cpp b/src/preprocess.cpp
+index 4030120..34a5a5e 100644
+--- a/src/preprocess.cpp
++++ b/src/preprocess.cpp
+@@ -154,6 +154,26 @@ static inline int nearest_multiple(int x, int p){
+     return (std::abs(up-x) <= std::abs(x-down)) ? up : down;
+ }
+ 
++bool preprocess_real_size(int src_w, int src_h, const Config& cfg, int& out_w, int& out_h){
++    if (src_w <= 0 || src_h <= 0) return false;
++    const int patch  = (int)cfg.patch_size;
++    const int target = cfg.img_resize_target>0 ? (int)cfg.img_resize_target : 504;
++    if (patch <= 0 || target <= 0) return false;
++    const bool upper = cfg.img_resize_mode.rfind("lower",0)!=0;
++
++    int w = src_w, h = src_h;
++    const int bound = upper ? std::max(w,h) : std::min(w,h);
++    if (bound != target) {
++        const double scale = (double)target / bound;
++        w = std::max(1, py_round(w*scale));
++        h = std::max(1, py_round(h*scale));
++    }
++    w = std::max(1, nearest_multiple(w, patch));
++    h = std::max(1, nearest_multiple(h, patch));
++    out_w = w; out_h = h;
++    return true;
++}
++
+ bool preprocess_real(const Image& img, const Config& cfg, Preprocessed& out,
+                      std::vector<uint8_t>* rgb_u8_out){
+     if (img.w<=0 || img.h<=0 || cfg.img_mean.size()<3 || cfg.img_std.size()<3) return false;
+diff --git a/src/preprocess.hpp b/src/preprocess.hpp
+index b744aaf..9d16292 100644
+--- a/src/preprocess.hpp
++++ b/src/preprocess.hpp
+@@ -29,6 +29,10 @@ bool preprocess(const Image& img, const Config& cfg, Preprocessed& out);
+ // COLMAP exporters need, guaranteed identical to the model-input resize.
+ bool preprocess_real(const Image& img, const Config& cfg, Preprocessed& out,
+                      std::vector<uint8_t>* rgb_u8_out = nullptr);
++// Geometry-only counterpart of preprocess_real(). Useful for GPU preprocessors:
++// computes the exact processed W/H (including Python rounding + patch rounding)
++// without touching pixel data.
++bool preprocess_real_size(int src_w, int src_h, const Config& cfg, int& out_w, int& out_h);
+ 
+ // cv2-faithful uint8 resizers (HWC RGB uint8 -> HWC RGB uint8).
+ Image resize_cubic(const Image& src, int dw, int dh);  // INTER_CUBIC, a=-0.75
+diff --git a/tests/test_capi.cpp b/tests/test_capi.cpp
+index 2934912..84e844a 100644
+--- a/tests/test_capi.cpp
++++ b/tests/test_capi.cpp
+@@ -3,7 +3,35 @@
+ #include <cstdio>
+ #include <cstring>
+ int main(){
+-    if (da_capi_abi_version() != 11) return 1;
++    if (da_capi_abi_version() != 13) return 1;
++
++    da_capi_depth_request req;
++    da_capi_depth_request_init(&req);
++    if (req.struct_size != sizeof(req) ||
++        req.output_element_type != DA_CAPI_DEPTH_ELEMENT_F16 ||
++        req.video_to_depth_uv[0] != 1.f ||
++        req.video_to_depth_uv[4] != 1.f ||
++        req.video_to_depth_uv[8] != 1.f ||
++        req.valid_depth_uv[0] != 0.f ||
++        req.valid_depth_uv[1] != 0.f ||
++        req.valid_depth_uv[2] != 1.f ||
++        req.valid_depth_uv[3] != 1.f) return 1;
++
++    da_capi_preprocess_desc pd;
++    da_capi_preprocess_desc_init(&pd);
++    if (pd.struct_size != sizeof(pd) ||
++        pd.source_to_depth_uv[0] != 1.f ||
++        pd.source_to_depth_uv[4] != 1.f ||
++        pd.source_to_depth_uv[8] != 1.f ||
++        pd.valid_depth_uv[2] != 1.f ||
++        pd.valid_depth_uv[3] != 1.f) return 1;
++
++    da_capi_depth_model_info mi;
++    da_capi_depth_model_info_init(&mi);
++    if (mi.struct_size != sizeof(mi) ||
++        mi.depth_semantics != DA_CAPI_DEPTH_SEMANTICS_UNKNOWN ||
++        mi.depth_representation != DA_CAPI_DEPTH_REPRESENTATION_UNKNOWN) return 1;
++
+     const char* gguf = std::getenv("DA_TEST_GGUF");
+     if (!gguf) return 77;
+     da_ctx* c = da_capi_load(gguf, 1);
+diff --git a/tests/test_capi_da2.cpp b/tests/test_capi_da2.cpp
+index e8ac79e..52a5666 100644
+--- a/tests/test_capi_da2.cpp
++++ b/tests/test_capi_da2.cpp
+@@ -5,6 +5,7 @@
+ #include <cstdlib>
+ #include <cstdio>
+ #include <cmath>
++#include <string>
+ 
+ static bool finite_all(const float* p, int n){
+     for (int i = 0; i < n; ++i) if (!std::isfinite(p[i])) return false;
+@@ -19,8 +20,58 @@ int main(){
+     if (!f){ std::fprintf(stderr, "sample image %s absent, skipping\n", png); return 77; }
+     std::fclose(f);
+ 
+-    da_ctx* c = da_capi_load(gguf, 1);
+-    if (!c){ std::fprintf(stderr, "da2: load failed\n"); return 1; }
++    // Explicit CPU selection must override any GPU backend compiled into the
++    // process (and any DA_DEVICE environment setting).
++    da_capi_load_options opts;
++    da_capi_load_options_init(&opts);
++    opts.n_threads = 1;
++    opts.device_policy = DA_CAPI_DEVICE_CPU;
++    da_ctx* c = da_capi_load_ex(gguf, &opts);
++    if (!c){ std::fprintf(stderr, "da2: explicit CPU load failed\n"); return 1; }
++    if (da_capi_is_offloading(c) != 0 || std::string(da_capi_device_name(c)) != "cpu") {
++        std::fprintf(stderr, "da2: CPU selection returned device=%s offload=%d\n",
++                     da_capi_device_name(c), da_capi_is_offloading(c));
++        da_capi_free(c);
++        return 1;
++    }
++
++    da_capi_depth_model_info mi;
++    da_capi_depth_model_info_init(&mi);
++    if (da_capi_get_depth_model_info(c, &mi) != 0 ||
++        mi.depth_semantics != DA_CAPI_DEPTH_SEMANTICS_RELATIVE ||
++        mi.depth_representation != DA_CAPI_DEPTH_REPRESENTATION_Z ||
++        mi.camera_intrinsics_capable != 0) {
++        std::fprintf(stderr, "da2: bad media metadata sem=%d repr=%d camera=%d\n",
++                     mi.depth_semantics, mi.depth_representation,
++                     mi.camera_intrinsics_capable);
++        da_capi_free(c);
++        return 1;
++    }
++
++    da_capi_preprocess_desc pd;
++    da_capi_preprocess_desc_init(&pd);
++    if (da_capi_get_preprocess_desc(c, 1920, 1080, &pd) != 0 ||
++        pd.output_width <= 0 || pd.output_height <= 0 ||
++        pd.source_to_depth_uv[0] != 1.f || pd.source_to_depth_uv[4] != 1.f ||
++        pd.source_to_depth_uv[8] != 1.f ||
++        pd.valid_depth_uv[0] != 0.f || pd.valid_depth_uv[1] != 0.f ||
++        pd.valid_depth_uv[2] != 1.f || pd.valid_depth_uv[3] != 1.f) {
++        std::fprintf(stderr, "da2: bad preprocess descriptor\n");
++        da_capi_free(c);
++        return 1;
++    }
++
++    da_capi_depth_request dr;
++    da_capi_depth_request_init(&dr);
++    if (dr.output_element_type != DA_CAPI_DEPTH_ELEMENT_F16 ||
++        dr.video_to_depth_uv[0] != 1.f || dr.video_to_depth_uv[4] != 1.f ||
++        dr.video_to_depth_uv[8] != 1.f ||
++        dr.valid_depth_uv[0] != 0.f || dr.valid_depth_uv[1] != 0.f ||
++        dr.valid_depth_uv[2] != 1.f || dr.valid_depth_uv[3] != 1.f) {
++        std::fprintf(stderr, "da2: bad depth request defaults\n");
++        da_capi_free(c);
++        return 1;
++    }
+ 
+     int H=0, W=0, is_metric=-1; float *depth=nullptr, *conf=nullptr, *sky=nullptr;
+     float ext[12], intr[9];
+diff --git a/tests/test_engine_da2.cpp b/tests/test_engine_da2.cpp
+index cd0443d..7871972 100644
+--- a/tests/test_engine_da2.cpp
++++ b/tests/test_engine_da2.cpp
+@@ -31,5 +31,14 @@ int main(){
+     if (!head.depth_relative(feats, H, W, ml.config().head_max_depth, depth)) return 1;
+     std::vector<float> ref;
+     if (!da_parity::load_baseline(base, "depth_da2", ref, s)) return 1;
+-    return da_parity::compare(depth, ref, "depth_da2", 3e-3f, 3e-3f) ? 0 : 1;
++    if (!da_parity::compare(depth, ref, "depth_da2_unfused", 3e-3f, 3e-3f)) return 1;
++
++    // Media fast path: DA2 used to require a host readback of all four backbone
++    // features before DPT. depth_preprocessed() must now produce the same result
++    // from one fused backbone+DPT graph.
++    auto eng = da::Engine::load(gguf, 1);
++    if (!eng) return 1;
++    std::vector<float> fused;
++    if (!eng->depth_preprocessed(img.data(), H, W, fused)) return 1;
++    return da_parity::compare(fused, ref, "depth_da2_fused", 3e-3f, 3e-3f) ? 0 : 1;
+ }
+diff --git a/tests/test_preprocess_real.cpp b/tests/test_preprocess_real.cpp
+index 9f63b98..798d4dd 100644
+--- a/tests/test_preprocess_real.cpp
++++ b/tests/test_preprocess_real.cpp
+@@ -39,8 +39,17 @@ int main(){
+     cfg.img_resize_target = 504;
+     cfg.img_resize_mode = "upper_bound";
+ 
++    int size_w = 0, size_h = 0;
++    if (!da::preprocess_real_size(img.w, img.h, cfg, size_w, size_h)) {
++        std::fprintf(stderr, "[preproc_real] preprocess_real_size failed\n"); return 1;
++    }
+     da::Preprocessed p;
+     if (!da::preprocess_real(img, cfg, p)) { std::fprintf(stderr, "[preproc_real] preprocess_real failed\n"); return 1; }
++    if (size_w != p.W || size_h != p.H) {
++        std::fprintf(stderr, "[preproc_real] geometry-only size mismatch %dx%d vs %dx%d\n",
++                     size_w, size_h, p.W, p.H);
++        return 1;
++    }
+ 
+     std::fprintf(stderr, "[preproc_real] in=%dx%d -> out=%dx%d (ref %ux%u) scale=(%.5f,%.5f)\n",
+                  img.w, img.h, p.W, p.H, out_w, out_h, p.scale_w, p.scale_h);

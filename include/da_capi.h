@@ -1,6 +1,7 @@
 #ifndef DA_CAPI_H
 #define DA_CAPI_H
 #include <stddef.h>
+#include <stdint.h>
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -19,8 +20,86 @@ typedef struct da_ctx da_ctx;
    10: added da_capi_set_fuse_params — scene-relative TSDF voxel/truncation knobs for
       the next streamed fuse (exposed as viewer sliders).
    11: added temporal exposed-face voxel mesh generation and retrieval for streamed
-      fused scenes. */
+      fused scenes.
+   12: added explicit per-context compute-device selection and raw/preprocessed
+      single-image depth entry points for embedded media pipelines.
+   13: added timestamped GPU depth-result metadata, UV transforms, depth semantics,
+      model/preprocess descriptors, and F16 device output for asynchronous media
+      depth side-stream producers. */
 int         da_capi_abi_version(void);
+
+/* Device selection for da_capi_load_ex / da_capi_load_nested_ex. DEFAULT keeps
+   the historical DA_DEVICE environment-variable behaviour. AUTO ignores it and
+   chooses GPU/IGPU then CPU. CPU explicitly forces CPU even in a GPU-enabled
+   build. NAMED selects a ggml registry device by name (e.g. "Vulkan0"). */
+enum {
+    DA_CAPI_DEVICE_DEFAULT = 0,
+    DA_CAPI_DEVICE_AUTO    = 1,
+    DA_CAPI_DEVICE_CPU     = 2,
+    DA_CAPI_DEVICE_NAMED   = 3,
+};
+typedef struct da_capi_load_options {
+    size_t      struct_size;
+    int         n_threads;
+    int         device_policy;
+    const char* device_name; /* only used with DA_CAPI_DEVICE_NAMED */
+} da_capi_load_options;
+void        da_capi_load_options_init(da_capi_load_options* options);
+da_ctx*     da_capi_load_ex(const char* gguf_path, const da_capi_load_options* options);
+da_ctx*     da_capi_load_nested_ex(const char* anyview_gguf, const char* metric_gguf,
+                                   const da_capi_load_options* options);
+const char* da_capi_device_name(const da_ctx* ctx); /* owned by ctx */
+int         da_capi_is_offloading(const da_ctx* ctx);
+
+/* Depth metadata used by real-time media integrations. "Metric meters" means the
+   produced scalar is intended to represent camera-space depth in metres. */
+enum {
+    DA_CAPI_DEPTH_SEMANTICS_UNKNOWN       = 0,
+    DA_CAPI_DEPTH_SEMANTICS_RELATIVE      = 1,
+    DA_CAPI_DEPTH_SEMANTICS_METRIC_METERS = 2,
+};
+enum {
+    DA_CAPI_DEPTH_REPRESENTATION_UNKNOWN = 0,
+    DA_CAPI_DEPTH_REPRESENTATION_Z       = 1,
+};
+enum {
+    DA_CAPI_DEPTH_ELEMENT_F32 = 0,
+    DA_CAPI_DEPTH_ELEMENT_F16 = 1,
+};
+
+typedef struct da_capi_depth_model_info {
+    size_t struct_size;
+    int depth_semantics;
+    int depth_representation;
+    /* Non-zero when the model's full image pipeline has a camera-intrinsics path.
+       The depth-only device-tensor entry point does not run that additional path. */
+    int camera_intrinsics_capable;
+} da_capi_depth_model_info;
+void da_capi_depth_model_info_init(da_capi_depth_model_info* info);
+int  da_capi_get_depth_model_info(da_ctx* ctx, da_capi_depth_model_info* info);
+
+/* Exact resize/normalization contract for a source image. source_to_depth_uv is a
+   normalized homogeneous 3x3 transform from the source image UV domain to the
+   model depth UV domain. Current preprocess_real() resizes the complete image and
+   therefore returns identity; making it explicit prevents future crop/pad changes
+   from silently misaligning renderer depth. valid_depth_uv = {min_u,min_v,max_u,max_v}. */
+typedef struct da_capi_preprocess_desc {
+    size_t struct_size;
+    int output_width;
+    int output_height;
+    float mean[3];
+    float std[3];
+    float source_to_depth_uv[9];
+    float valid_depth_uv[4];
+} da_capi_preprocess_desc;
+void da_capi_preprocess_desc_init(da_capi_preprocess_desc* desc);
+int  da_capi_get_preprocess_desc(da_ctx* ctx, int src_w, int src_h,
+                                 da_capi_preprocess_desc* desc);
+
+/* Advanced interop only: borrowed ggml_backend_t as an opaque pointer, valid until
+   da_capi_free(ctx). This lets a backend-specific adapter import/allocate persistent
+   device tensors without exposing ggml headers through this C API. */
+void*       da_capi_backend_handle(da_ctx* ctx);
 /* Set scene-relative TSDF surface-fusion knobs consumed by the NEXT
    da_capi_points_stream whose fuse flag is set. voxel_frac: voxel edge as a fraction
    of the reconstruction's bbox diagonal (fusion detail; <=0 => 0.004). trunc_mult:
@@ -46,6 +125,70 @@ const char* da_capi_last_error(da_ctx* ctx);                     /* owned by ctx
 /* Run depth on an image file. On success writes *out_h,*out_w and returns a malloc'd
    float[H*W] depth map (row-major); caller frees via da_capi_free_floats. NULL on error. */
 float* da_capi_depth_path(da_ctx* ctx, const char* image_path, int* out_h, int* out_w);
+/* CPU/host-memory media path: HWC RGB8 with caller-provided row stride in bytes
+   (0 => tightly packed width*3). The normal model preprocessing is applied. */
+float* da_capi_depth_rgb8(da_ctx* ctx, const unsigned char* rgb, int width, int height,
+                          size_t row_stride, int* out_h, int* out_w);
+/* Already-preprocessed host input: normalized planar F32 CHW [3,H,W]. This skips
+   image decode and resize/normalization and runs the fused depth-only graph. */
+float* da_capi_depth_chw_f32(da_ctx* ctx, const float* chw, int h, int w);
+/* Metadata attached to one asynchronous media-depth request. The Vulkan/media
+   wrapper should populate frame_id and pts_ns from the decoded source frame and
+   compose all decoder crop/rotation/aspect corrections into video_to_depth_uv.
+   Use da_capi_depth_request_init() before overriding fields. */
+typedef struct da_capi_depth_request {
+    size_t struct_size;
+    uint64_t frame_id;
+    int64_t pts_ns;
+    int output_element_type; /* DA_CAPI_DEPTH_ELEMENT_* */
+    float video_to_depth_uv[9];
+    float valid_depth_uv[4]; /* {min_u,min_v,max_u,max_v} */
+} da_capi_depth_request;
+void da_capi_depth_request_init(da_capi_depth_request* request);
+
+/* Description of the backend-resident depth tensor passed to the consumer.
+   The Vulkan bridge adds its own exported buffer/image and completion
+   semaphore/value around this result; this structure deliberately contains no
+   Vulkan handles and no stereo/RGB output. */
+typedef struct da_capi_device_depth_result {
+    size_t struct_size;
+    uint64_t frame_id;
+    int64_t pts_ns;
+    int width;
+    int height;
+    int element_type;         /* DA_CAPI_DEPTH_ELEMENT_* */
+    int depth_semantics;      /* DA_CAPI_DEPTH_SEMANTICS_* */
+    int depth_representation; /* DA_CAPI_DEPTH_REPRESENTATION_* */
+    float video_to_depth_uv[9];
+    float valid_depth_uv[4];
+    int has_intrinsics;
+    float intrinsics[9];
+} da_capi_device_depth_result;
+
+/* Advanced zero-host-readback hook for GPU media pipelines. input_tensor is a
+   backend-resident ggml_tensor* containing normalized F32 [W,H,3,1] data on the
+   same device selected for ctx. Inference is synchronous with respect to this
+   call (run it on the producer's inference worker), but all full-frame data stays
+   on the backend. The consumer receives the final depth tensor plus timestamped
+   side-stream metadata and must GPU-copy/consume the tensor before returning.
+   It must not retain backend/tensor pointers after the callback. */
+typedef int (*da_capi_device_depth_consumer_ex)(
+    void* user, void* backend, const void* depth_tensor,
+    const da_capi_device_depth_result* result);
+int da_capi_depth_device_tensor_ex(da_ctx* ctx, void* input_tensor, int h, int w,
+                                   const da_capi_depth_request* request,
+                                   da_capi_device_depth_consumer_ex consume, void* user);
+
+/* Compatibility form: F32 output, identity UV transform, no frame timestamp. */
+typedef int (*da_capi_device_depth_consumer)(void* user, void* backend, const void* depth_tensor);
+int da_capi_depth_device_tensor(da_ctx* ctx, void* input_tensor, int h, int w,
+                                da_capi_device_depth_consumer consume, void* user);
+
+/* Legacy geometry/normalization query retained for existing callers. New media
+   integrations should use da_capi_get_preprocess_desc() so the UV mapping is
+   explicit even when it is identity today. */
+int da_capi_preprocess_info(da_ctx* ctx, int src_w, int src_h,
+                            int* out_w, int* out_h, float mean3[3], float std3[3]);
 void   da_capi_free_floats(float* p);
 /* Run pose; fills ext[12] (3x4 row-major) and intr[9] (3x3). Returns 0 ok, -1 error. */
 int da_capi_pose_path(da_ctx* ctx, const char* image_path, float out_ext[12], float out_intr[9]);

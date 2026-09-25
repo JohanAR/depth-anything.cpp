@@ -39,8 +39,17 @@ int main(){
     cfg.img_resize_target = 504;
     cfg.img_resize_mode = "upper_bound";
 
+    int size_w = 0, size_h = 0;
+    if (!da::preprocess_real_size(img.w, img.h, cfg, size_w, size_h)) {
+        std::fprintf(stderr, "[preproc_real] preprocess_real_size failed\n"); return 1;
+    }
     da::Preprocessed p;
     if (!da::preprocess_real(img, cfg, p)) { std::fprintf(stderr, "[preproc_real] preprocess_real failed\n"); return 1; }
+    if (size_w != p.W || size_h != p.H) {
+        std::fprintf(stderr, "[preproc_real] geometry-only size mismatch %dx%d vs %dx%d\n",
+                     size_w, size_h, p.W, p.H);
+        return 1;
+    }
 
     std::fprintf(stderr, "[preproc_real] in=%dx%d -> out=%dx%d (ref %ux%u) scale=(%.5f,%.5f)\n",
                  img.w, img.h, p.W, p.H, out_w, out_h, p.scale_w, p.scale_h);

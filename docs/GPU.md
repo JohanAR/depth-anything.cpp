@@ -78,10 +78,12 @@ When a non-CPU device is selected (`Backend::is_offloading()` true),
 
 ### GPU-friendly op routing
 
-After a successful offload, `Engine::load` calls `da::set_gpu_mode(true)`
-(see `src/compute_mode.hpp`). In GPU mode the graph builders route to **standard
-ggml ops that have CUDA kernels**, instead of the CPU-tuned custom paths that
-would force GPU↔CPU round-trips:
+`Backend::compute()` scopes `gpu_mode()` to the backend executing that graph
+(see `src/compute_mode.hpp`). The flag is thread-local, so an explicitly forced
+CPU context and a Vulkan/CUDA/Metal context may coexist and execute concurrently
+without changing each other's graph construction. In GPU mode the graph builders
+route to **standard ggml ops that have accelerator kernels**, instead of the
+CPU-tuned custom paths that would force GPU↔CPU round-trips:
 
 - **Conv (`src/dpt_blocks.cpp`)** — 3×3 stride-1 convs use
   `ggml_conv_2d_direct` (CUDA kernel) instead of the CPU-only Winograd custom op
@@ -133,3 +135,12 @@ GPU→host→GPU round-trip and a second graph setup. The out-layer post-process
 Parity: fused vs unfused depth max|d|=1.2e-7 (CPU); CPU-vs-GPU corr=0.999998. On the **unified**
 GB10 it's latency-neutral (160 vs 160 ms — the round-trip was already cheap); the win is for
 **discrete** (PCIe) GPUs where the feats round-trip is a real copy. No regression anywhere; 31/31 tests.
+
+## Embedded media-player device selection
+
+The C API also supports per-context selection without mutating `DA_DEVICE`:
+`da_capi_load_ex()` accepts `DA_CAPI_DEVICE_DEFAULT`, `AUTO`, `CPU`, or `NAMED`.
+This is useful for applications that expose an explicit "run depth on CPU/GPU"
+setting, and allows CPU and accelerator contexts to coexist in one process.
+
+For depth-only video/photo integration, see `docs/VR_MEDIA_INTEGRATION.md`.

@@ -31,5 +31,14 @@ int main(){
     if (!head.depth_relative(feats, H, W, ml.config().head_max_depth, depth)) return 1;
     std::vector<float> ref;
     if (!da_parity::load_baseline(base, "depth_da2", ref, s)) return 1;
-    return da_parity::compare(depth, ref, "depth_da2", 3e-3f, 3e-3f) ? 0 : 1;
+    if (!da_parity::compare(depth, ref, "depth_da2_unfused", 3e-3f, 3e-3f)) return 1;
+
+    // Media fast path: DA2 used to require a host readback of all four backbone
+    // features before DPT. depth_preprocessed() must now produce the same result
+    // from one fused backbone+DPT graph.
+    auto eng = da::Engine::load(gguf, 1);
+    if (!eng) return 1;
+    std::vector<float> fused;
+    if (!eng->depth_preprocessed(img.data(), H, W, fused)) return 1;
+    return da_parity::compare(fused, ref, "depth_da2_fused", 3e-3f, 3e-3f) ? 0 : 1;
 }

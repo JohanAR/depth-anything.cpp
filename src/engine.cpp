@@ -13,26 +13,39 @@
 #include "gs_head.hpp"
 #include "gs_adapter.hpp"
 #include "nested.hpp"
-#include "compute_mode.hpp"
 
 namespace da {
 std::unique_ptr<Engine> Engine::load(const std::string& path, int n_threads){
-    std::unique_ptr<Engine> e(new Engine());
+    EngineLoadOptions options;
+    options.n_threads = n_threads;
+    return load(path, options);
+}
+
+std::unique_ptr<Engine> Engine::load(const std::string& path,
+                                     const EngineLoadOptions& options){
+    std::unique_ptr<Engine> e(new Engine(options.backend));
     if (!e->ml_.load(path)) { DA_LOG("engine: load failed"); return nullptr; }
-    e->be_.set_n_threads(n_threads > 0 ? n_threads : 1);
+    e->be_.set_n_threads(options.n_threads > 0 ? options.n_threads : 1);
     if (!e->ml_.offload_weights(e->be_)) { DA_LOG("engine: offload failed"); return nullptr; }
-    // Route graph builders to GPU-friendly standard ops iff weights are device-resident.
-    da::set_gpu_mode(e->be_.is_offloading());
     return e;
 }
+
 std::unique_ptr<Engine> Engine::load_nested(const std::string& anyview_gguf,
                                             const std::string& metric_gguf, int n_threads){
-    auto e = load(anyview_gguf, n_threads);
+    EngineLoadOptions options;
+    options.n_threads = n_threads;
+    return load_nested(anyview_gguf, metric_gguf, options);
+}
+
+std::unique_ptr<Engine> Engine::load_nested(const std::string& anyview_gguf,
+                                            const std::string& metric_gguf,
+                                            const EngineLoadOptions& options){
+    auto e = load(anyview_gguf, options);
     if (!e) { DA_LOG("engine: anyview load failed"); return nullptr; }
     e->metric_ml_.reset(new ModelLoader());
-    e->metric_be_.reset(new Backend());
+    e->metric_be_.reset(new Backend(options.backend));
     if (!e->metric_ml_->load(metric_gguf)) { DA_LOG("engine: metric load failed"); return nullptr; }
-    e->metric_be_->set_n_threads(n_threads > 0 ? n_threads : 1);
+    e->metric_be_->set_n_threads(options.n_threads > 0 ? options.n_threads : 1);
     if (!e->metric_ml_->offload_weights(*e->metric_be_)) { DA_LOG("engine: metric offload failed"); return nullptr; }
     return e;
 }
@@ -83,6 +96,13 @@ bool Engine::depth_relative(const Image& img, std::vector<float>& depth_out, int
     Preprocessed p;
     if (!preprocess_real(img, ml_.config(), p)) { DA_LOG("depth_relative: preprocess_real failed"); return false; }
     H = p.H; W = p.W;
+
+    // Prefer the one-graph media path, but keep the old two-graph implementation
+    // as an A/B escape hatch and backend-compatibility fallback.
+    const char* fenv = std::getenv("DA_FUSED");
+    const bool fused_off = fenv && std::string(fenv) == "0";
+    if (!fused_off && depth_preprocessed(p.chw.data(), H, W, depth_out)) return true;
+
     DinoBackbone bb(ml_, be_);
     std::vector<std::vector<float>> feats, cam_tokens;
     if (!bb.forward(p.chw, H, W, feats, cam_tokens)) { DA_LOG("depth_relative: backbone failed"); return false; }
@@ -93,6 +113,78 @@ bool Engine::depth_relative_path(const std::string& image_path, std::vector<floa
                                  int& H, int& W){
     Image img; if (!load_image_rgb(image_path, img)) { DA_LOG("depth_relative: load image failed"); return false; }
     return depth_relative(img, depth_out, H, W);
+}
+
+
+ggml_tensor* Engine::build_depth_only_graph(ggml_context* ctx, ggml_tensor* input_chw,
+                                            int H, int W, GraphInputPool& pool,
+                                            ggml_type output_type){
+    if (!input_chw || H <= 0 || W <= 0) return nullptr;
+    const int patch = (int)ml_.config().patch_size;
+    if (patch <= 0 || (H % patch) != 0 || (W % patch) != 0) return nullptr;
+
+    DinoBackbone bb(ml_, be_);
+    DptHead head(ml_, be_);
+    ggml_tensor* feat[4] = { nullptr, nullptr, nullptr, nullptr };
+    if (!bb.build_feats_graph(ctx, input_chw, H, W, pool, feat)) return nullptr;
+    ggml_tensor* logits = head.build_depth_graph(ctx, feat, H, W, pool,
+                                                 nullptr, nullptr, nullptr);
+    if (!logits) return nullptr;
+
+    // DPT logits are [W,H,C,1]. Keep depth channel 0 and perform the final
+    // model-specific activation in-graph so the device callback receives actual
+    // depth, not logits.
+    ggml_tensor* depth = ggml_view_2d(ctx, logits, W, H, logits->nb[1], 0);
+    depth = ggml_cont(ctx, depth);
+    if (is_da2()) {
+        if (ml_.config().head_max_depth > 0.f)
+            depth = ggml_scale(ctx, ggml_sigmoid(ctx, depth), ml_.config().head_max_depth);
+        else
+            depth = ggml_relu(ctx, depth);
+    } else {
+        depth = ggml_exp(ctx, depth);
+    }
+    if (output_type != GGML_TYPE_F32) {
+        if (output_type != GGML_TYPE_F16) return nullptr;
+        depth = ggml_cast(ctx, depth, output_type);
+    }
+    return depth;
+}
+
+bool Engine::depth_preprocessed(const float* chw, int H, int W,
+                                std::vector<float>& depth_out){
+    if (!chw || is_nested()) return false;
+    GraphInputPool pool;
+    return be_.compute([&](ggml_context* ctx) -> ggml_tensor* {
+        const int64_t ne[4] = { W, H, 3, 1 };
+        ggml_tensor* input = be_.add_graph_input_nd(ctx, pool, chw, ne, 4);
+        return build_depth_only_graph(ctx, input, H, W, pool);
+    }, depth_out);
+}
+
+bool Engine::depth_preprocessed_device(
+        ggml_tensor* input_chw, int H, int W, ggml_type output_type,
+        const std::function<bool(ggml_backend_t, const ggml_tensor*)>& consume){
+    if (!input_chw || !consume || is_nested() || !be_.is_offloading()) return false;
+    if (output_type != GGML_TYPE_F32 && output_type != GGML_TYPE_F16) return false;
+    if (input_chw->type != GGML_TYPE_F32 || input_chw->ne[0] != W ||
+        input_chw->ne[1] != H || input_chw->ne[2] != 3 || input_chw->ne[3] != 1)
+        return false;
+
+    // The input may be persistent metadata from another ggml_context, but its
+    // storage must belong to the same backend device as this Engine. This catches
+    // accidental cross-device pointers before the graph allocator reaches them.
+    ggml_backend_buffer_t buf = input_chw->view_src ? input_chw->view_src->buffer
+                                                     : input_chw->buffer;
+    if (!buf) return false;
+    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buf);
+    if (!buft || ggml_backend_buft_get_device(buft) != ggml_backend_get_device(be_.handle()))
+        return false;
+
+    GraphInputPool pool;
+    return be_.compute_device([&](ggml_context* ctx) -> ggml_tensor* {
+        return build_depth_only_graph(ctx, input_chw, H, W, pool, output_type);
+    }, consume);
 }
 bool Engine::depth_native(const std::string& image_path, std::vector<float>& depth_out,
                           std::vector<float>& conf_out, int& H, int& W){

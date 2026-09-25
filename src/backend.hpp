@@ -10,6 +10,18 @@
 
 namespace da {
 
+enum class DevicePolicy {
+    Environment, // legacy DA_DEVICE behaviour
+    Auto,        // ignore DA_DEVICE; GPU/IGPU then CPU
+    Cpu,         // force CPU
+    Named,       // exact registry device name (case-insensitive), else CPU
+};
+
+struct BackendOptions {
+    DevicePolicy device_policy = DevicePolicy::Environment;
+    std::string device_name;
+};
+
 // Owns host buffers for graph inputs so they outlive a compute() call.
 struct GraphInputPool {
     std::vector<std::vector<float>> bufs;
@@ -33,7 +45,7 @@ public:
     //   - a device name   selects that registry device by name (case-insensitive,
     //                     e.g. "CUDA0", "Vulkan0", "Metal").
     //   - unset           auto-pick the first GPU/IGPU device, else CPU.
-    Backend();
+    explicit Backend(const BackendOptions& options = {});
     ~Backend();
     Backend(const Backend&) = delete;
     Backend& operator=(const Backend&) = delete;
@@ -71,6 +83,13 @@ public:
     // graph_nodes overrides the node budget for this call (0 => kDefaultGraphNodes).
     bool compute(const std::function<ggml_tensor*(ggml_context*)>& build,
                  std::vector<float>& out, size_t graph_nodes = 0);
+    // Execute the graph but keep the final tensor on its backend. `consume` runs
+    // synchronously after graph completion and before graph metadata/allocation can
+    // be recycled. It is intended for GPU->GPU bridge copies; it MUST NOT retain
+    // the ggml_tensor pointer after returning. No final tensor readback is done.
+    bool compute_device(const std::function<ggml_tensor*(ggml_context*)>& build,
+                        const std::function<bool(ggml_backend_t, const ggml_tensor*)>& consume,
+                        size_t graph_nodes = 0);
     // Like compute but also reads back tensors registered via capture() during build.
     bool forward_capture(const std::function<ggml_tensor*(ggml_context*)>& build,
                          std::vector<float>& out, size_t graph_nodes = 0);
@@ -89,6 +108,10 @@ private:
     std::string device_name_ = "cpu";
     bool        offloading_  = false;  // true iff `backend` is a non-CPU device
     int         n_threads_   = 1;
+    bool compute_impl(const std::function<ggml_tensor*(ggml_context*)>& build,
+                      std::vector<float>* out,
+                      const std::function<bool(ggml_backend_t, const ggml_tensor*)>* consume,
+                      size_t graph_nodes);
 };
 
 }  // namespace da
