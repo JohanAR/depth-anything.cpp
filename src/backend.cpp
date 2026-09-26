@@ -304,6 +304,17 @@ bool Backend::compute_impl(const std::function<ggml_tensor*(ggml_context*)>& bui
         }
     }
 
+    // Device consumers promise no frame/intermediate readbacks. Reject a mixed
+    // graph before allocation or execution, not merely a CPU-resident output.
+    if (consume && (need_sched || !impl_->captures.empty())) {
+        DA_LOG("Backend::compute_device: graph requires CPU fallback or capture");
+        impl_->pending.clear();
+        impl_->captures.clear();
+        impl_->roots.clear();
+        ggml_free(ctx);
+        return false;
+    }
+
     // One-time diagnostic (GPU path): does the fused flash-attention node actually
     // run on THIS device, or does the scheduler silently offload it to CPU? On
     // Vulkan the flash kernel is gated on coopmat2 / subgroup shuffle+vote and the

@@ -25,7 +25,9 @@ typedef struct da_ctx da_ctx;
       single-image depth entry points for embedded media pipelines.
    13: added timestamped GPU depth-result metadata, UV transforms, depth semantics,
       model/preprocess descriptors, and F16 device output for asynchronous media
-      depth side-stream producers. */
+      depth side-stream producers.
+   14: added intermediate resize geometry and relative inverse-depth metadata;
+      device-tensor execution now rejects intermediate CPU fallback. */
 int         da_capi_abi_version(void);
 
 /* Device selection for da_capi_load_ex / da_capi_load_nested_ex. DEFAULT keeps
@@ -61,6 +63,7 @@ enum {
 enum {
     DA_CAPI_DEPTH_REPRESENTATION_UNKNOWN = 0,
     DA_CAPI_DEPTH_REPRESENTATION_Z       = 1,
+    DA_CAPI_DEPTH_REPRESENTATION_INVERSE = 2,
 };
 enum {
     DA_CAPI_DEPTH_ELEMENT_F32 = 0,
@@ -95,6 +98,10 @@ typedef struct da_capi_preprocess_desc {
 void da_capi_preprocess_desc_init(da_capi_preprocess_desc* desc);
 int  da_capi_get_preprocess_desc(da_ctx* ctx, int src_w, int src_h,
                                  da_capi_preprocess_desc* desc);
+/* Dimensions after boundary resize, before patch rounding. Each resize
+   quantizes to RGB8; upsampling uses cubic (-0.75), downsampling uses area. */
+int da_capi_get_preprocess_intermediate_size(da_ctx* ctx, int src_w, int src_h,
+                                            int* width, int* height);
 
 /* Advanced interop only: borrowed ggml_backend_t as an opaque pointer, valid until
    da_capi_free(ctx). This lets a backend-specific adapter import/allocate persistent

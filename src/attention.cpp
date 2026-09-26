@@ -71,7 +71,7 @@ ggml_tensor* attention(ggml_context* ctx, ggml_tensor* x, const AttnWeights& w,
         ggml_tensor* kf = f16kv ? ggml_cast(ctx, kp, GGML_TYPE_F16) : kp;
         ggml_tensor* vf = f16kv ? ggml_cast(ctx, vp, GGML_TYPE_F16) : vp;
         ggml_tensor* o = ggml_flash_attn_ext(ctx, qp, kf, vf, nullptr, scale, 0.0f, 0.0f);
-        ggml_flash_attn_ext_set_prec(o, GGML_PREC_F32); // match manual F32 softmax
+        ggml_prec_set_acc(o, GGML_PREC_F32); // match manual F32 softmax
         o = ggml_reshape_2d(ctx, o, embed, tok);         // out is [D,H,tok,1] -> [embed,tok]
         return linear(ctx, w.proj_w, o, w.proj_b);
     }
@@ -86,7 +86,7 @@ ggml_tensor* attention(ggml_context* ctx, ggml_tensor* x, const AttnWeights& w,
         return linear(ctx, w.proj_w, o, w.proj_b);
     }
     ggml_tensor* sc = ggml_mul_mat(ctx, kp, qp);                      // [tok_k,tok_q,H]
-    ggml_mul_mat_set_prec(sc, GGML_PREC_F32);
+    ggml_prec_set_acc(sc, GGML_PREC_F32);
     sc = ggml_soft_max_ext(ctx, sc, nullptr, scale, 0.0f);
     ggml_tensor* vt = ggml_cont(ctx, ggml_permute(ctx, vp, 1,0,2,3)); // [tok,D,H]
     ggml_tensor* o  = ggml_mul_mat(ctx, vt, sc);                      // [D,tok_q,H]

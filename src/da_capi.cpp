@@ -169,7 +169,7 @@ static da_ctx* capi_wrap_engine(std::unique_ptr<da::Engine> e){
 }
 
 extern "C" {
-int da_capi_abi_version(void){ return 13; }
+int da_capi_abi_version(void){ return 14; }
 
 void da_capi_load_options_init(da_capi_load_options* options){
     if (options) *options = capi_default_load_options(1);
@@ -189,7 +189,8 @@ int da_capi_get_depth_model_info(da_ctx* c, da_capi_depth_model_info* info){
         return -1;
     }
     info->depth_semantics = capi_depth_semantics(*c->engine);
-    info->depth_representation = DA_CAPI_DEPTH_REPRESENTATION_Z;
+    info->depth_representation = c->engine->is_da2() && !capi_is_metric(c->engine->config())
+        ? DA_CAPI_DEPTH_REPRESENTATION_INVERSE : DA_CAPI_DEPTH_REPRESENTATION_Z;
     info->camera_intrinsics_capable = capi_camera_intrinsics_capable(*c->engine) ? 1 : 0;
     return 0;
 }
@@ -392,7 +393,8 @@ int da_capi_depth_device_tensor_ex(da_ctx* c, void* input_tensor, int h, int w,
     result.height = h;
     result.element_type = req.output_element_type;
     result.depth_semantics = capi_depth_semantics(*c->engine);
-    result.depth_representation = DA_CAPI_DEPTH_REPRESENTATION_Z;
+    result.depth_representation = c->engine->is_da2() && !capi_is_metric(c->engine->config())
+        ? DA_CAPI_DEPTH_REPRESENTATION_INVERSE : DA_CAPI_DEPTH_REPRESENTATION_Z;
     std::memcpy(result.video_to_depth_uv, req.video_to_depth_uv,
                 sizeof(result.video_to_depth_uv));
     std::memcpy(result.valid_depth_uv, req.valid_depth_uv,
@@ -442,6 +444,18 @@ int da_capi_depth_device_tensor(da_ctx* c, void* input_tensor, int h, int w,
     capi_compat_device_consumer compat{consume, user};
     return da_capi_depth_device_tensor_ex(c, input_tensor, h, w, &req,
                                           capi_compat_device_consume, &compat);
+}
+
+int da_capi_get_preprocess_intermediate_size(da_ctx* c, int src_w, int src_h,
+                                            int* width, int* height){
+    if (!c || !c->engine || !width || !height || src_w <= 0 || src_h <= 0) return -1;
+    const auto& cfg = c->engine->config();
+    const int target = cfg.img_resize_target > 0 ? (int)cfg.img_resize_target : 504;
+    const bool upper = cfg.img_resize_mode.rfind("lower", 0) != 0;
+    const double scale = (double)target / (upper ? std::max(src_w, src_h) : std::min(src_w, src_h));
+    *width = std::max(1, (int)std::nearbyint(src_w * scale));
+    *height = std::max(1, (int)std::nearbyint(src_h * scale));
+    return 0;
 }
 
 int da_capi_get_preprocess_desc(da_ctx* c, int src_w, int src_h,
