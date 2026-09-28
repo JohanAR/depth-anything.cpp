@@ -304,10 +304,10 @@ bool Backend::compute_impl(const std::function<ggml_tensor*(ggml_context*)>& bui
         }
     }
 
-    // Device consumers promise no frame/intermediate readbacks. Reject a mixed
-    // graph before allocation or execution, not merely a CPU-resident output.
-    if (consume && (need_sched || !impl_->captures.empty())) {
-        DA_LOG("Backend::compute_device: graph requires CPU fallback or capture");
+    // Mixed graphs may transfer unsupported operations to CPU. Explicit debug
+    // captures remain forbidden; the consumer checks final output placement.
+    if (consume && !impl_->captures.empty()) {
+        DA_LOG("Backend::compute_device: graph requires intermediate capture");
         impl_->pending.clear();
         impl_->captures.clear();
         impl_->roots.clear();

@@ -26,8 +26,7 @@ typedef struct da_ctx da_ctx;
    13: added timestamped GPU depth-result metadata, UV transforms, depth semantics,
       model/preprocess descriptors, and F16 device output for asynchronous media
       depth side-stream producers.
-   14: added intermediate resize geometry and relative inverse-depth metadata;
-      device-tensor execution now rejects intermediate CPU fallback. */
+   14: added intermediate resize geometry and relative inverse-depth metadata. */
 int         da_capi_abi_version(void);
 
 /* Device selection for da_capi_load_ex / da_capi_load_nested_ex. DEFAULT keeps
@@ -172,11 +171,12 @@ typedef struct da_capi_device_depth_result {
     float intrinsics[9];
 } da_capi_device_depth_result;
 
-/* Advanced zero-host-readback hook for GPU media pipelines. input_tensor is a
+/* Advanced device-input/output hook for GPU media pipelines. input_tensor is a
    backend-resident ggml_tensor* containing normalized F32 [W,H,3,1] data on the
    same device selected for ctx. Inference is synchronous with respect to this
-   call (run it on the producer's inference worker), but all full-frame data stays
-   on the backend. The consumer receives the final depth tensor plus timestamped
+   call (run it on the producer's inference worker). Unsupported intermediate
+   operations may use CPU fallback; final output must reside on the selected
+   accelerator. The consumer receives the final depth tensor plus timestamped
    side-stream metadata and must GPU-copy/consume the tensor before returning.
    It must not retain backend/tensor pointers after the callback. */
 typedef int (*da_capi_device_depth_consumer_ex)(
